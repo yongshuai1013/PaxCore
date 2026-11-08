@@ -166,7 +166,18 @@ pub struct Syscalls {
     pub umask: u32,
     /// The core-wide AF_UNIX listener registry.
     pub unix: std::rc::Rc<std::cell::RefCell<UnixCore>>,
+    /// The core-wide MAP_SHARED backing registry: host file
+    /// path -> shared bytes. Every process mapping the same
+    /// file MAP_SHARED aliases the same store (GB's property
+    /// workspace crosses process boundaries this way). Entries
+    /// initialize from the host file on first use and are never
+    /// written back -- the registry is the run's page cache.
+    pub areas:
+        std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, SharedBytes>>>,
 }
+
+/// One shared file area's backing store.
+pub type SharedBytes = std::rc::Rc<std::cell::RefCell<Vec<u8>>>;
 
 fn err(code: i32) -> u32 {
     (-code) as u32
@@ -226,6 +237,7 @@ impl Syscalls {
             unix: std::rc::Rc::new(std::cell::RefCell::new(UnixCore {
                 listeners: std::collections::HashMap::new(),
             })),
+            areas: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
         }
     }
 
@@ -313,6 +325,7 @@ impl Syscalls {
                     dir_entries: fd.dir_entries.clone(),
                     status_flags: fd.status_flags,
                     cloexec: fd.cloexec,
+                    path: fd.path.clone(),
                 },
             );
         }
@@ -342,6 +355,7 @@ impl Syscalls {
             binder: self.binder.clone(),
             umask: self.umask,
             unix: self.unix.clone(),
+            areas: self.areas.clone(),
         }
     }
 
@@ -355,12 +369,24 @@ impl Syscalls {
     }
 
     fn do_open(&mut self, base: Option<String>, path: &str, flags: u32) -> u32 {
+        let guest_abs = match &base {
+            Some(b) => self.fs.resolve_from(b, path),
+            None => self.fs.resolve(path),
+        };
         let ret = self.do_open_inner(base, path, flags);
-        // O_NONBLOCK given at open time becomes the fd's
-        // initial status flag (fcntl can change it later).
-        if flags & 0x800 != 0 && (ret as i32) >= 0 {
+        if (ret as i32) >= 0 {
             if let Some(f) = self.fs.fds.get_mut(&(ret as i32)) {
-                f.status_flags |= 0x800;
+                // O_NONBLOCK given at open time becomes the
+                // fd's initial status flag (fcntl can change
+                // it later).
+                if flags & 0x800 != 0 {
+                    f.status_flags |= 0x800;
+                }
+                // The path travels with the fd: MAP_SHARED
+                // keys on it, and GB's property workspace fd
+                // must still identify its area after init
+                // unlinks the path.
+                f.path = Some(guest_abs);
             }
         }
         ret
@@ -818,8 +844,15 @@ impl Syscalls {
                 0
             }
             5 => {
+                // open(path, flags, mode): flags is a1. (This
+                // arm long passed a2 -- the mode -- as flags;
+                // most opens survived because mode 0666 happens
+                // to contain the O_CREAT bit and existing files
+                // ignore access bits, but any O_CREAT open with
+                // mode 0600 -- GB init's /dev/__properties__ --
+                // silently failed with ENOENT.)
                 let p = read_guest_str(mem, a0);
-                self.do_open(None, &p, a2)
+                self.do_open(None, &p, a1)
             }
             6 => {
                 // close
@@ -1253,7 +1286,11 @@ impl Syscalls {
         };
         let mut out = Fd::new(kind);
         out.status_flags = src.status_flags;
-        out.cloexec = src.cloexec;
+        // dup()/dup2()/F_DUPFD clear FD_CLOEXEC on the new fd
+        // (GB init relies on this: it dups the property
+        // workspace fd into each service it spawns).
+        out.cloexec = false;
+        out.path = src.path.clone();
         Some(out)
     }
 }
@@ -1551,6 +1588,7 @@ impl Syscalls {
                 let want = a0 & !0xFFF;
                 let base = if fixed && want != 0 {
                     self.unmap_range(want, len);
+                    mem.remove_shared(want, len);
                     want
                 } else if want != 0 && self.range_free(want, len) {
                     want
@@ -1573,6 +1611,47 @@ impl Syscalls {
                 self.maps.push((base, len));
                 mem.zero_range(base, len as usize);
                 let anon = a3 & 0x20 != 0 || a4 as i32 == -1;
+                if a3 & 0x01 != 0 {
+                    // MAP_SHARED: the range aliases a backing
+                    // store shared by every process mapping the
+                    // same area, instead of a private snapshot.
+                    if anon {
+                        let backing: SharedBytes =
+                            std::rc::Rc::new(std::cell::RefCell::new(vec![0u8; len as usize]));
+                        mem.add_shared(base, len, 0, backing);
+                        return base;
+                    }
+                    let fpath = match self.fs.fds.get(&(a4 as i32)) {
+                        Some(fd) if matches!(fd.kind, FdKind::File(_)) => fd.path.clone(),
+                        _ => None,
+                    };
+                    if let Some(gpath) = fpath {
+                        let host = self.fs.host_path(&gpath);
+                        let key = host.to_string_lossy().into_owned();
+                        let backing: SharedBytes = {
+                            let mut areas = self.areas.borrow_mut();
+                            areas
+                                .entry(key)
+                                .or_insert_with(|| {
+                                    let data = std::fs::read(&host).unwrap_or_default();
+                                    std::rc::Rc::new(std::cell::RefCell::new(data))
+                                })
+                                .clone()
+                        };
+                        let off = (a5 as usize) * 4096;
+                        {
+                            let mut b = backing.borrow_mut();
+                            let need = off + a1 as usize;
+                            if b.len() < need {
+                                b.resize(need, 0);
+                            }
+                        }
+                        mem.add_shared(base, len, off, backing);
+                        return base;
+                    }
+                    // Shared on a non-file fd: fall through to
+                    // the snapshot path (nothing to alias).
+                }
                 if !anon {
                     if let Some(fd) = self.fs.fds.get_mut(&(a4 as i32)) {
                         if let FdKind::File(f) = &mut fd.kind {
@@ -1615,7 +1694,33 @@ impl Syscalls {
                     return err(22); // EINVAL
                 }
                 self.unmap_range(base, len);
+                // Drop shared windows FIRST: unmapping must
+                // not zero the backing (other processes may
+                // still have it mapped), only the private
+                // bytes shadowed underneath.
+                mem.remove_shared(base, len);
                 mem.zero_range(base, len as usize);
+                0
+            }
+            93 | 94 => {
+                // ftruncate / ftruncate64(fd, len[, len_hi])
+                let len = if nr == 93 {
+                    a1 as u64
+                } else {
+                    (a1 as u64) | ((a2 as u64) << 32)
+                };
+                match self.fs.fds.get_mut(&(a0 as i32)).map(|f| &mut f.kind) {
+                    Some(FdKind::File(f)) => match f.set_len(len) {
+                        Ok(()) => 0,
+                        Err(e) => io_err(&e),
+                    },
+                    Some(_) => err(EINVAL),
+                    None => err(EBADF),
+                }
+            }
+            144 => {
+                // msync: shared backings are always current
+                // in-core; there is nothing to flush.
                 0
             }
             195 => {

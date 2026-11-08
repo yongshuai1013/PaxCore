@@ -146,6 +146,12 @@ pub struct Fd {
     /// FD_CLOEXEC, from fcntl(F_SETFD). Recorded, not acted on
     /// (exec does not close fds yet).
     pub cloexec: bool,
+    /// Guest absolute path this fd was opened from, when known.
+    /// MAP_SHARED keys its cross-process backing store on it:
+    /// GB's property workspace fd is dup'd into services after
+    /// the path itself is unlinked, so the path has to travel
+    /// with the fd, not be re-derived from the filesystem.
+    pub path: Option<String>,
 }
 
 impl Fd {
@@ -156,6 +162,7 @@ impl Fd {
             dir_entries: None,
             status_flags: 0,
             cloexec: false,
+            path: None,
         }
     }
     pub fn nonblock(&self) -> bool {
