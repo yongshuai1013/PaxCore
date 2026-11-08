@@ -39,9 +39,10 @@ pub struct Cpu {
     pub trace: bool,
     /// PAXCORE_TRACE_AFTER threshold, read once at construction.
     pub trace_after: u64,
-    /// PAXCORE_WATCHPC=<hex>: dump registers whenever the PC
-    /// reaches this address.
+    /// PAXCORE_WATCHPC=<hex>[,<hex>]: dump registers whenever the PC
+    /// reaches one of these addresses.
     pub watch_pc: Option<u32>,
+    pub watch_pc2: Option<u32>,
 }
 
 impl Cpu {
@@ -65,7 +66,19 @@ impl Cpu {
                 .unwrap_or(0),
             watch_pc: std::env::var("PAXCORE_WATCHPC")
                 .ok()
-                .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()),
+                .and_then(|v| {
+                    v.split(',')
+                        .filter_map(|p| u32::from_str_radix(p.trim().trim_start_matches("0x"), 16).ok())
+                        .next()
+                })
+                .or_else(|| None),
+            watch_pc2: std::env::var("PAXCORE_WATCHPC")
+                .ok()
+                .and_then(|v| {
+                    v.split(',')
+                        .filter_map(|p| u32::from_str_radix(p.trim().trim_start_matches("0x"), 16).ok())
+                        .nth(1)
+                }),
         };
         cpu.r[REG_PC] = entry;
         cpu.r[REG_SP] = sp;

@@ -41,8 +41,8 @@ impl Cpu {
         }
         let hw = rd16(mem, pc);
         self.steps += 1;
-        if let Some(wp) = self.watch_pc {
-            if pc == wp {
+        if self.watch_pc == Some(pc) || self.watch_pc2 == Some(pc) {
+            if true {
                 eprintln!(
                     "[watchpc] steps={} pc=0x{pc:08x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x} r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x} sp={:#010x} lr={:#010x} nzcv={}{}{}{}",
                     self.steps,
@@ -774,10 +774,21 @@ impl Cpu {
             // in F8DF the D sits in the third nibble. (Reading
             // it from [11:8] turned every LDR.W into an STRB and
             // sent the GB linker walking a corrupted stack.)
+            // hw bit 8 splits the space: F8xx = unsigned forms,
+            // F9xx = SIGNED byte/half loads (LDRSB/LDRSH) plus
+            // PLI. Ignoring it turned LDRSB into LDRB: libdvm's
+            // dexGetInstrOrTableWidthAbs reads its width table
+            // with ldrsb.w (F910) and the table stores NEGATIVE
+            // widths for the odex-only opcodes (0xF0 -> -3), so a
+            // zero-extended read returned 253 and the dexopt
+            // method scanner ran away through the string pool.
+            // Encoding matrix pinned against assembler output
+            // (guest/lsenc matrix, 2026-11-09).
             let op = (hw >> 4) & 0xF;
             let rn = (hw & 0xF) as usize;
             let rt = ((hw2 >> 12) & 0xF) as usize;
             let load = op & 1 == 1;
+            let signed = (hw >> 8) & 1 == 1;
             let size = [1u32, 2, 4][((op >> 1) & 3) as usize];
             let base = if rn == REG_PC { pc4 } else { self.r[rn] };
             let (eff, writeback) = if rn == REG_PC && load && (op >= 0x8 || (hw2 >> 6) & 0x3F == 0) {
@@ -810,10 +821,19 @@ impl Cpu {
                 let w = if wb || !pre { Some(off_addr) } else { None };
                 (e, w)
             };
+            if load && rt == REG_PC && rn != REG_PC && size == 1 {
+                // PLD / PLI (byte forms with Rt == 15): a hint,
+                // not a load into PC. (Word-size LDR PC stays a
+                // real branch below.)
+                self.r[REG_PC] = next;
+                return Step::Continue;
+            }
             if load {
-                let val = match size {
-                    1 => self.rd8(mem, eff),
-                    2 => mem.read_u16(eff) as u32,
+                let val = match (size, signed) {
+                    (1, true) => (self.rd8(mem, eff) as u8 as i8) as u32,
+                    (2, true) => (mem.read_u16(eff) as i16) as u32,
+                    (1, _) => self.rd8(mem, eff),
+                    (2, _) => mem.read_u16(eff) as u32,
                     _ => self.rd(mem, eff),
                 };
                 if rt == REG_PC {
