@@ -3,6 +3,8 @@
 //! carries pc + raw word, which is exactly the data that drives
 //! decoder growth on the next milestone.
 
+use crate::mem::Mem;
+
 pub const REG_SP: usize = 13;
 pub const REG_LR: usize = 14;
 pub const REG_PC: usize = 15;
@@ -37,6 +39,9 @@ pub struct Cpu {
     pub trace: bool,
     /// PAXCORE_TRACE_AFTER threshold, read once at construction.
     pub trace_after: u64,
+    /// PAXCORE_WATCHPC=<hex>: dump registers whenever the PC
+    /// reaches this address.
+    pub watch_pc: Option<u32>,
 }
 
 impl Cpu {
@@ -58,6 +63,9 @@ impl Cpu {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
+            watch_pc: std::env::var("PAXCORE_WATCHPC")
+                .ok()
+                .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()),
         };
         cpu.r[REG_PC] = entry;
         cpu.r[REG_SP] = sp;
@@ -173,19 +181,26 @@ impl Cpu {
 }
 
 impl Cpu {
-    pub(crate) fn rd(&self, mem: &[u8], addr: u32) -> u32 {
-        let a = addr as usize;
-        u32::from_le_bytes([mem[a], mem[a + 1], mem[a + 2], mem[a + 3]])
+    pub(crate) fn rd(&self, mem: &Mem, addr: u32) -> u32 {
+        mem.read_u32(addr)
     }
-    pub(crate) fn wr(&self, mem: &mut [u8], addr: u32, val: u32) {
-        let a = addr as usize;
-        mem[a..a + 4].copy_from_slice(&val.to_le_bytes());
+    pub(crate) fn wr(&self, mem: &mut Mem, addr: u32, val: u32) {
+        mem.write_u32(addr, val);
     }
-    pub(crate) fn rd8(&self, mem: &[u8], addr: u32) -> u32 {
-        mem[addr as usize] as u32
+    pub(crate) fn rd8(&self, mem: &Mem, addr: u32) -> u32 {
+        mem.byte(addr) as u32
     }
-    pub(crate) fn wr8(&self, mem: &mut [u8], addr: u32, val: u32) {
-        mem[addr as usize] = val as u8;
+    pub(crate) fn wr8(&self, mem: &mut Mem, addr: u32, val: u32) {
+        mem.set_byte(addr, val as u8);
+    }
+
+    /// Interworking jump: a data value written to PC selects
+    /// the instruction set by bit 0 (ARMv7 semantics for LDR/MOV/
+    /// LDM to PC). Storing the raw odd value instead once made
+    /// the GB linker's PLT veneers execute Thumb code as ARM.
+    pub(crate) fn jump_to(&mut self, val: u32) {
+        self.thumb = val & 1 == 1;
+        self.r[REG_PC] = val & !1;
     }
 
     pub(crate) fn unimp(&self, word: u32) -> ! {
@@ -199,17 +214,36 @@ impl Cpu {
     /// Execute one instruction. Guest memory is bounds-checked by
     /// slice indexing; a bad access panics with the address context
     /// added by the caller.
-    pub fn step(&mut self, mem: &mut [u8]) -> Step {
+    pub fn step(&mut self, mem: &mut Mem) -> Step {
         if self.thumb {
             return self.step_thumb(mem);
         }
         let pc = self.r[REG_PC];
+        if let Some(out) = self.kuser_call(mem, pc) {
+            return out;
+        }
         let word = self.rd(mem, pc);
         self.steps += 1;
         if self.trace && self.steps >= self.trace_after {
             eprintln!("[trace] A pc=0x{pc:08x} w=0x{word:08x} r0=0x{:08x} r1=0x{:08x}", self.r[0], self.r[1]);
         }
         let next_pc = pc.wrapping_add(4);
+        // BLX immediate: 1111 101 H imm24 -- unconditional,
+        // always switches to Thumb. The cond==0xF space must be
+        // claimed before the generic cond check drops it.
+        if word & 0xFE00_0000 == 0xFA00_0000 {
+            let h = ((word >> 24) & 1) as u32;
+            let imm24 = (word & 0x00FF_FFFF) as i32;
+            let signed = (imm24 << 8) >> 8;
+            self.r[REG_LR] = next_pc;
+            let target = (pc as i32)
+                .wrapping_add(8)
+                .wrapping_add(signed.wrapping_mul(4))
+                .wrapping_add((h << 1) as i32) as u32;
+            self.r[REG_PC] = target & !1;
+            self.thumb = true;
+            return Step::Continue;
+        }
         let cond = word >> 28;
         if cond != 0xE && !self.cond_ok(cond) {
             self.r[REG_PC] = next_pc;
@@ -274,7 +308,10 @@ impl Cpu {
                     base.wrapping_sub(count * 4)
                 };
             }
-            self.r[REG_PC] = loaded_pc.unwrap_or(next_pc);
+            match loaded_pc {
+                Some(v) => self.jump_to(v),
+                None => self.r[REG_PC] = next_pc,
+            }
             return Step::Continue;
         }
         // Sign/zero extend family (UXTB/SXTH/...): bits 27-20 in
@@ -409,7 +446,7 @@ impl Cpu {
             if load {
                 let val = if byte { self.rd8(mem, eff) } else { self.rd(mem, eff) };
                 if rd == REG_PC {
-                    self.r[REG_PC] = val;
+                    self.jump_to(val);
                     jumped = true;
                 } else {
                     self.r[rd] = val;
@@ -452,7 +489,7 @@ impl Cpu {
                     0x1F => {
                         // LDREXH
                         let a = addr as usize;
-                        self.r[rd] = u16::from_le_bytes([mem[a], mem[a + 1]]) as u32;
+                        self.r[rd] = mem.read_u16(a as u32) as u32;
                     }
                     0x1B => {
                         // LDREXD
@@ -473,7 +510,7 @@ impl Cpu {
                     0x1E => {
                         let a = addr as usize;
                         let v = self.r[rm] as u16;
-                        mem[a..a + 2].copy_from_slice(&v.to_le_bytes());
+                        mem.write_u16(a as u32, v);
                         self.r[rd] = 0;
                     }
                     _ => {
@@ -579,7 +616,7 @@ impl Cpu {
             };
             if !test_op {
                 if rd == REG_PC {
-                    self.r[REG_PC] = result;
+                    self.jump_to(result);
                     jumped = true;
                 } else {
                     self.r[rd] = result;
@@ -641,7 +678,7 @@ impl Cpu {
 
     /// Multiply family + extra (halfword / signed) load-store.
     /// Entered with pc still pointing at the instruction.
-    fn exec_multiply_extra(&mut self, mem: &mut [u8], word: u32) {
+    fn exec_multiply_extra(&mut self, mem: &mut Mem, word: u32) {
         let pc = self.r[REG_PC];
         let next_pc = pc.wrapping_add(4);
         // Discriminator inside this space: bits 6-5 == 00 means
@@ -766,12 +803,12 @@ impl Cpu {
             let val = match kind {
                 1 => {
                     let a = eff as usize;
-                    u16::from_le_bytes([mem[a], mem[a + 1]]) as u32
+                    mem.read_u16(a as u32) as u32
                 }
-                2 => mem[eff as usize] as i8 as u32,
+                2 => mem.byte(eff) as i8 as u32,
                 _ => {
                     let a = eff as usize;
-                    u16::from_le_bytes([mem[a], mem[a + 1]]) as i16 as u32
+                    (mem.read_u16(a as u32) as i16) as u32
                 }
             };
             self.r[rd] = val;
@@ -781,7 +818,7 @@ impl Cpu {
             }
             let a = eff as usize;
             let v = self.r[rd] as u16;
-            mem[a..a + 2].copy_from_slice(&v.to_le_bytes());
+            mem.write_u16(a as u32, v);
         }
         if wback {
             self.r[rn] = if pre {
@@ -796,9 +833,51 @@ impl Cpu {
     }
 
     /// Misc space: BX/BLX register, CLZ, MRS/MSR, coprocessor
+    /// The kernel's kuser helper page (0xFFFF0000): fixed ARM
+    /// routines the C library calls directly. They are kernel
+    /// surface, so the core implements their semantics itself:
+    ///   0xFFFF0FA0 __kernel_memory_barrier -- a no-op here
+    ///     (single-interpreter ordering), r0 clobbered to 0.
+    ///   0xFFFF0FC0 __kernel_cmpxchg -- *r2 == r0 ? (*r2 = r1,
+    ///     return 0) : return -1 (r1/r2 preserved on failure,
+    ///     matching the real helper closely enough for libc).
+    ///   0xFFFF0FE0 __kernel_get_tls -- returns the thread's
+    ///     TLS pointer (the value set by set_tls).
+    /// GB's linker reaches __kernel_get_tls through a literal
+    /// in its text, which is how this gap was found.
+    pub(crate) fn kuser_call(&mut self, mem: &mut Mem, pc: u32) -> Option<Step> {
+        match pc {
+            0xFFFF_0FA0 => {
+                self.r[0] = 0;
+                let lr = self.r[REG_LR];
+                self.jump_to(lr);
+                Some(Step::Continue)
+            }
+            0xFFFF_0FC0 => {
+                let (old, new, ptr) = (self.r[0], self.r[1], self.r[2]);
+                if mem.read_u32(ptr) == old {
+                    mem.write_u32(ptr, new);
+                    self.r[0] = 0;
+                } else {
+                    self.r[0] = u32::MAX; // -1
+                }
+                let lr = self.r[REG_LR];
+                self.jump_to(lr);
+                Some(Step::Continue)
+            }
+            0xFFFF_0FE0 => {
+                self.r[0] = self.tls;
+                let lr = self.r[REG_LR];
+                self.jump_to(lr);
+                Some(Step::Continue)
+            }
+            _ => None,
+        }
+    }
+
     /// thread-pointer access, barriers. Returns true when handled
     /// (and PC advanced); false lets normal decode proceed.
-    fn try_misc(&mut self, _mem: &mut [u8], word: u32) -> bool {
+    fn try_misc(&mut self, _mem: &mut Mem, word: u32) -> bool {
         let pc = self.r[REG_PC];
         let next_pc = pc.wrapping_add(4);
         // BX Rm / BLX Rm
@@ -920,7 +999,7 @@ impl Cpu {
         sign * (1.0 + frac) * 2f64.powi(e)
     }
 
-    fn exec_vfp(&mut self, mem: &mut [u8], word: u32) -> bool {
+    fn exec_vfp(&mut self, mem: &mut Mem, word: u32) -> bool {
         let pc = self.r[REG_PC];
         let next_pc = pc.wrapping_add(4);
         let top4 = (word >> 24) & 0xF;

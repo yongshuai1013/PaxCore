@@ -2,13 +2,15 @@ mod block;
 mod cpu;
 mod elf;
 mod fs;
+mod mem;
 mod syscall;
 mod thumb;
+
+use mem::Mem;
 
 use cpu::{Cpu, Step};
 use std::time::Instant;
 
-const MEM_SIZE: usize = 256 * 1024 * 1024;
 fn max_steps() -> u64 {
     std::env::var("PAXCORE_MAX_STEPS")
         .ok()
@@ -16,14 +18,81 @@ fn max_steps() -> u64 {
         .unwrap_or(20_000_000_000)
 }
 
-fn put32(mem: &mut [u8], addr: u32, val: u32) {
-    mem[addr as usize..addr as usize + 4].copy_from_slice(&val.to_le_bytes());
+fn put32(mem: &mut Mem, addr: u32, val: u32) {
+    mem.write_u32(addr, val);
 }
+
+/// Guest stack top for the initial process.
+const STACK_TOP: u32 = 0x1000_0000;
 
 /// Build the Linux initial stack: argc, argv[], NULL, envp[], NULL,
 /// auxv pairs, AT_NULL -- with strings above. Returns the stack ptr.
-fn build_stack(mem: &mut [u8], argv: &[String], env: &[String]) -> u32 {
-    let mut sp = (MEM_SIZE as u32) & !15;
+/// auxv entries a dynamically-linked program needs to hand
+/// control to its interpreter: where the main program's headers
+/// are, where the interpreter was loaded, and where the main
+/// program really starts.
+pub struct DynAux {
+    pub phdr: u32,
+    pub phent: u32,
+    pub phnum: u32,
+    pub base: u32,
+    pub entry: u32,
+    pub execfn: String,
+}
+
+pub struct ProgramImage {
+    /// Where execution actually starts (the interpreter's entry
+    /// for dynamic programs, the program's own otherwise).
+    pub start_entry: u32,
+    pub image_end: u32,
+    pub dyn_aux: Option<DynAux>,
+}
+
+/// Load a program and its interpreter (if any) into guest
+/// memory. The interpreter is resolved inside the guest root,
+/// exactly like a kernel resolving PT_INTERP at exec time.
+fn load_program(bytes: &[u8], mem: &mut Mem, root: &str) -> Result<ProgramImage, String> {
+    let main = elf::load(bytes, mem)?;
+    if let Some(interp_path) = &main.interp {
+        let fs = crate::fs::GuestFs::new(root.to_string());
+        let host = fs.host_path(interp_path);
+        let ibytes = std::fs::read(&host)
+            .map_err(|e| format!("cannot load interpreter {interp_path}: {e}"))?;
+        let il = elf::load(&ibytes, mem)?;
+        // AT_BASE is the interpreter's image base (its lowest
+        // LOAD vaddr). Deriving it from the phdr address breaks
+        // when the interpreter's headers sit outside every LOAD
+        // (the GB linker's first LOAD is empty), which once made
+        // the linker mistake itself for the main program and
+        // re-run its own init forever.
+        let base = il.min_vaddr;
+        return Ok(ProgramImage {
+            start_entry: il.entry,
+            image_end: main.image_end,
+            dyn_aux: Some(DynAux {
+                phdr: main.phdr,
+                phent: main.phent,
+                phnum: main.phnum,
+                base,
+                entry: main.raw_entry,
+                execfn: String::new(),
+            }),
+        });
+    }
+    Ok(ProgramImage {
+        start_entry: main.entry,
+        image_end: main.image_end,
+        dyn_aux: None,
+    })
+}
+
+fn build_stack(
+    mem: &mut Mem,
+    argv: &[String],
+    env: &[String],
+    dyn_aux: Option<&DynAux>,
+) -> u32 {
+    let mut sp = STACK_TOP & !15;
     // Random bytes for AT_RANDOM.
     sp -= 16;
     let random_ptr = sp;
@@ -41,13 +110,13 @@ fn build_stack(mem: &mut [u8], argv: &[String], env: &[String]) -> u32 {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
-        mem[random_ptr as usize + i] = (x >> 32) as u8;
+        mem.set_byte(random_ptr + i as u32, (x >> 32) as u8);
     }
-    let mut push_str = |mem: &mut [u8], sp: &mut u32, s: &str| -> u32 {
+    let mut push_str = |mem: &mut Mem, sp: &mut u32, s: &str| -> u32 {
         *sp -= (s.len() as u32 + 1 + 3) & !3;
         let p = *sp;
-        mem[p as usize..p as usize + s.len()].copy_from_slice(s.as_bytes());
-        mem[p as usize + s.len()] = 0;
+        mem.write_slice(p, s.as_bytes());
+        mem.set_byte(p + s.len() as u32, 0);
         p
     };
     let mut arg_ptrs: Vec<u32> = Vec::new();
@@ -58,7 +127,12 @@ fn build_stack(mem: &mut [u8], argv: &[String], env: &[String]) -> u32 {
     for e in env {
         env_ptrs.push(push_str(mem, &mut sp, e));
     }
-    let words = 1 + arg_ptrs.len() + 1 + env_ptrs.len() + 1 + 2 * 9 + 2;
+    let execfn_ptr = match dyn_aux {
+        Some(d) if !d.execfn.is_empty() => push_str(mem, &mut sp, &d.execfn),
+        _ => 0,
+    };
+    let n_aux = 9 + if dyn_aux.is_some() { 6 } else { 0 };
+    let words = 1 + arg_ptrs.len() + 1 + env_ptrs.len() + 1 + 2 * n_aux + 2;
     sp -= (words as u32) * 4;
     sp &= !7;
     let mut w = sp;
@@ -92,6 +166,20 @@ fn build_stack(mem: &mut [u8], argv: &[String], env: &[String]) -> u32 {
         put32(mem, w + 4, v);
         w += 8;
     }
+    if let Some(d) = dyn_aux {
+        for (k, v) in [
+            (3, d.phdr),      // AT_PHDR
+            (4, d.phent),     // AT_PHENT
+            (5, d.phnum),     // AT_PHNUM
+            (7, d.base),      // AT_BASE
+            (9, d.entry),     // AT_ENTRY
+            (31, execfn_ptr), // AT_EXECFN
+        ] {
+            put32(mem, w, k);
+            put32(mem, w + 4, v);
+            w += 8;
+        }
+    }
     put32(mem, w, 0);
     put32(mem, w + 4, 0);
     sp
@@ -111,20 +199,30 @@ fn main() {
     let guest_path = args[0].clone();
     let guest_argv: Vec<String> = args.clone();
     let bytes = std::fs::read(&guest_path).expect("read guest ELF");
-    let mut mem = vec![0u8; MEM_SIZE];
-    let loaded = elf::load(&bytes, &mut mem).expect("load guest ELF");
+    let mut mem = Mem::new();
+    let mut loaded = load_program(&bytes, &mut mem, &rootfs).expect("load guest program");
+    if let Some(d) = &mut loaded.dyn_aux {
+        if d.execfn.is_empty() {
+            d.execfn = guest_argv[0].clone();
+        }
+    }
     let sp = build_stack(
         &mut mem,
         &guest_argv,
         &["PATH=/bin:/usr/bin".into(), "HOME=/".into(), "TERM=dumb".into()],
+        loaded.dyn_aux.as_ref(),
     );
-    let mut cpu = Cpu::new(loaded.entry & !1, sp);
-    cpu.thumb = loaded.entry & 1 == 1;
+    let mut cpu = Cpu::new(loaded.start_entry & !1, sp);
+    cpu.thumb = loaded.start_entry & 1 == 1;
     let watch: Option<u32> = std::env::var("PAXCORE_WATCH")
         .ok()
         .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
     let mut watch_val: u32 = 0;
-    let sys = syscall::Syscalls::new(rootfs, loaded.image_end);
+    let mut sys = syscall::Syscalls::new(rootfs.clone(), loaded.image_end);
+    sys.exe_path = match guest_path.strip_prefix(&rootfs) {
+        Some(rest) => format!("/{}", rest.trim_start_matches('/')),
+        None => guest_argv[0].clone(),
+    };
     // Block decode cache (JIT stage 2a): ARM mode only, and off
     // whenever tracing or watching is requested so those stay
     // instruction-exact. PAXCORE_NOCACHE=1 forces the legacy path
@@ -132,6 +230,7 @@ fn main() {
     // after every syscall (a syscall may map or replace code).
     let cache_on = !cpu.trace
         && watch.is_none()
+        && cpu.watch_pc.is_none()
         && std::env::var_os("PAXCORE_NOCACHE").is_none();
     let init = Process {
         pid: 100,
@@ -168,7 +267,7 @@ fn main() {
 /// Guest memory, shared between the threads of a group
 /// (CLONE_VM) and private to fork children (which get a sparse
 /// copy in a fresh cell).
-type SharedMem = std::rc::Rc<std::cell::RefCell<Vec<u8>>>;
+type SharedMem = std::rc::Rc<std::cell::RefCell<Mem>>;
 
 /// One guest process or thread: its own CPU, (possibly shared)
 /// memory, syscall state and block cache.
@@ -393,6 +492,7 @@ impl Scheduler {
                 return SliceEnd::Budget;
             }
             let pre_pc = self.procs[idx].cpu.r[15];
+            let pre_thumb = self.procs[idx].cpu.thumb;
             let step_result = {
                 let p = &mut self.procs[idx];
                 let mut guard = p.mem.borrow_mut();
@@ -408,14 +508,22 @@ impl Scheduler {
                     p.cpu.step(&mut guard)
                 }
             };
+            if pre_thumb
+                && !self.procs[idx].cpu.thumb
+                && std::env::var_os("PAXCORE_WATCHMODE").is_some()
+            {
+                let c = &self.procs[idx].cpu;
+                eprintln!(
+                    "[modeflip] T->A by insn at pc=0x{pre_pc:08x}: newpc=0x{:08x} lr=0x{:08x} r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x} r4=0x{:08x} (step {})",
+                    c.r[15], c.r[14], c.r[0], c.r[1], c.r[2], c.r[3], c.r[4], c.steps
+                );
+            }
             match step_result {
                 Step::Continue => {
                     if let Some(w) = watch {
                         let p = &self.procs[idx];
                         let guard = p.mem.borrow();
-                        let v = u32::from_le_bytes(
-                            guard[w as usize..w as usize + 4].try_into().unwrap(),
-                        );
+                        let v = guard.read_u32(w);
                         if v != *watch_val {
                             eprintln!(
                                 "[watch] 0x{w:08x}: 0x{watch_val:08x} -> 0x{v:08x} after insn at pc=0x{pre_pc:08x} (step {})",
@@ -510,8 +618,9 @@ impl Scheduler {
                 return;
             }
         };
-        let mut mem = vec![0u8; MEM_SIZE];
-        let loaded = match elf::load(&bytes, &mut mem) {
+        let mut mem = Mem::new();
+        let rootfs = self.procs[idx].sys.fs.root.clone().to_string_lossy().into_owned();
+        let mut loaded = match load_program(&bytes, &mut mem, &rootfs) {
             Ok(l) => l,
             Err(_) => {
                 self.procs[idx].cpu.r[0] = ENOEXEC_NEG;
@@ -548,18 +657,24 @@ impl Scheduler {
         } else {
             argv.to_vec()
         };
-        let sp = build_stack(&mut mem, &argv_owned, envp);
+        if let Some(d) = &mut loaded.dyn_aux {
+            if d.execfn.is_empty() {
+                d.execfn = path.to_string();
+            }
+        }
+        let sp = build_stack(&mut mem, &argv_owned, envp, loaded.dyn_aux.as_ref());
         let old_trace = self.procs[idx].cpu.trace;
         let old_trace_after = self.procs[idx].cpu.trace_after;
         let p = &mut self.procs[idx];
-        let mut cpu = Cpu::new(loaded.entry & !1, sp);
-        cpu.thumb = loaded.entry & 1 == 1;
+        let mut cpu = Cpu::new(loaded.start_entry & !1, sp);
+        cpu.thumb = loaded.start_entry & 1 == 1;
         cpu.trace = old_trace;
         cpu.trace_after = old_trace_after;
         p.cpu = cpu;
         p.mem = std::rc::Rc::new(std::cell::RefCell::new(mem));
         p.blocks.clear();
         p.sys.reset_exec(loaded.image_end);
+        p.sys.exe_path = path.to_string();
     }
 
     /// clone(120): fork's general form. Sharing follows the
@@ -611,9 +726,9 @@ impl Scheduler {
             let mem = if flags & CLONE_VM != 0 {
                 parent.mem.clone()
             } else {
-                std::rc::Rc::new(std::cell::RefCell::new(clone_mem_sparse(
-                    &parent.mem.borrow(),
-                )))
+                std::rc::Rc::new(std::cell::RefCell::new(
+                    parent.mem.borrow().clone_sparse(),
+                ))
             };
             let mut sys = parent.sys.fork_clone(tid);
             sys.tgid = tgid;
@@ -793,8 +908,7 @@ impl Scheduler {
                     put32(&mut mem, sp + 224, cpsr);
                     put32(&mut mem, sp + 228, 0); // fault_address
                     // uc_sigmask = mask in force before delivery
-                    let a = (sp + 232) as usize;
-                    mem[a..a + 8].copy_from_slice(&old_mask.to_le_bytes());
+                    mem.write_u64(sp + 232, old_mask);
                 }
                 p.cpu.r[13] = sp;
                 p.cpu.r[0] = sig;
@@ -822,13 +936,7 @@ impl Scheduler {
     fn do_sigreturn(&mut self, idx: usize) {
         let p = &mut self.procs[idx];
         let sp = p.cpu.r[13];
-        let w = |mem: &[u8], off: u32| -> u32 {
-            u32::from_le_bytes(
-                mem[(sp + off) as usize..(sp + off) as usize + 4]
-                    .try_into()
-                    .unwrap(),
-            )
-        };
+        let w = |mem: &Mem, off: u32| -> u32 { mem.read_u32(sp + off) };
         let (mut regs, cpsr, saved_mask) = {
             let mem = p.mem.borrow();
             let mut regs = [0u32; 16];
@@ -841,9 +949,7 @@ impl Scheduler {
             regs[14] = w(&mem, 216);
             regs[15] = w(&mem, 220);
             let cpsr = w(&mem, 224);
-            let a = (sp + 232) as usize;
-            let saved_mask =
-                u64::from_le_bytes(mem[a..a + 8].try_into().unwrap());
+            let saved_mask = mem.read_u64(sp + 232);
             (regs, cpsr, saved_mask)
         };
         p.cpu.r = regs;
@@ -945,9 +1051,9 @@ impl Scheduler {
                 ppid: parent.pid,
                 tgid: child_pid,
                 cpu,
-                mem: std::rc::Rc::new(std::cell::RefCell::new(clone_mem_sparse(
-                    &parent.mem.borrow(),
-                ))),
+                mem: std::rc::Rc::new(std::cell::RefCell::new(
+                    parent.mem.borrow().clone_sparse(),
+                )),
                 sys: parent.sys.fork_clone(child_pid),
                 blocks: std::collections::HashMap::new(),
                 zombie: None,
@@ -1037,19 +1143,8 @@ impl Scheduler {
 
 /// Sparse memory copy for fork: zero pages are not touched, so a
 /// 256MB address space costs only its dirty footprint.
-fn clone_mem_sparse(src: &[u8]) -> Vec<u8> {
-    let mut dst = vec![0u8; src.len()];
-    const CHUNK: usize = 64 * 1024;
-    for (i, chunk) in src.chunks(CHUNK).enumerate() {
-        if chunk.iter().any(|&b| b != 0) {
-            let off = i * CHUNK;
-            dst[off..off + chunk.len()].copy_from_slice(chunk);
-        }
-    }
-    dst
-}
 
-fn dump_mem(mem: &[u8]) {
+fn dump_mem(mem: &Mem) {
     if let Ok(spec) = std::env::var("PAXCORE_DUMP") {
         // spec: "start-end:path" hex addresses
         let mut it = spec.split(':');
@@ -1057,7 +1152,9 @@ fn dump_mem(mem: &[u8]) {
             let mut ab = range.split('-');
             let s = u32::from_str_radix(ab.next().unwrap_or("0"), 16).unwrap_or(0) as usize;
             let e = u32::from_str_radix(ab.next().unwrap_or("0"), 16).unwrap_or(0) as usize;
-            let _ = std::fs::write(path, &mem[s..e]);
+            let mut buf = vec![0u8; e - s];
+            mem.read_slice(s as u32, &mut buf);
+            let _ = std::fs::write(path, &buf);
         }
     }
 }

@@ -23,6 +23,7 @@
 //! is set (differential testing against the legacy path).
 
 use crate::cpu::{Cpu, Step, REG_LR, REG_PC};
+use crate::mem::Mem;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -121,6 +122,13 @@ pub struct Block {
 /// (or to an exclusion the legacy dispatch checks first).
 fn decode(pc: u32, word: u32) -> Op {
     let cond = (word >> 28) as u8;
+    // The cond==0xF space is unconditional encodings (BLX
+    // immediate among them): never decode those here, the
+    // legacy path owns them. (A plain B/BL decode once silently
+    // swallowed a BLX and ran Thumb code as ARM.)
+    if cond == 0xF {
+        return Op::Legacy;
+    }
     // SVC: bits 27-24 == 1111 (legacy checks after cond).
     if (word >> 24) & 0xF == 0xF {
         return Op::Svc;
@@ -271,7 +279,7 @@ fn writes_pc(op: &Op) -> bool {
     }
 }
 
-fn decode_block(cpu: &Cpu, mem: &[u8], start: u32) -> Block {
+fn decode_block(cpu: &Cpu, mem: &Mem, start: u32) -> Block {
     let mut ops = Vec::new();
     let mut pc = start;
     for _ in 0..MAX_BLOCK_OPS {
@@ -306,7 +314,7 @@ impl Cpu {
     /// caller must service it; None when the block simply finished
     /// and execution can continue at the new pc. The caller
     /// guarantees ARM mode with the cache enabled.
-    pub fn run_block(&mut self, mem: &mut [u8], cache: &mut BlockCache) -> Option<Step> {
+    pub fn run_block(&mut self, mem: &mut Mem, cache: &mut BlockCache) -> Option<Step> {
         let start = self.r[REG_PC];
         let block = match cache.get(&start) {
             Some(b) => b.clone(),
@@ -353,7 +361,7 @@ impl Cpu {
         }
     }
 
-    fn exec_op(&mut self, mem: &mut [u8], pc: u32, op: &Op) -> Flow {
+    fn exec_op(&mut self, mem: &mut Mem, pc: u32, op: &Op) -> Flow {
         let next_pc = pc.wrapping_add(4);
         let cond = match op {
             Op::DpImm { cond, .. }
@@ -452,7 +460,7 @@ impl Cpu {
                         self.rd(mem, eff)
                     };
                     if *rd as usize == REG_PC {
-                        self.r[REG_PC] = val;
+                        self.jump_to(val);
                         jumped = true;
                     } else {
                         self.r[*rd as usize] = val;
@@ -531,7 +539,7 @@ impl Cpu {
                 }
                 match loaded_pc {
                     Some(v) => {
-                        self.r[REG_PC] = v;
+                        self.jump_to(v);
                         Flow::Jumped
                     }
                     None => {

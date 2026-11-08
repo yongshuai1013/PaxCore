@@ -178,34 +178,30 @@ impl GuestFs {
     }
 }
 
-pub fn read_guest_str(mem: &[u8], ptr: u32) -> String {
+pub fn read_guest_str(mem: &crate::mem::Mem, ptr: u32) -> String {
     let mut s = Vec::new();
-    let mut a = ptr as usize;
-    while a < mem.len() && mem[a] != 0 {
-        s.push(mem[a]);
+    let mut a = ptr;
+    while (a as usize) < mem.len() && mem.byte(a) != 0 {
+        s.push(mem.byte(a));
         a += 1;
     }
     String::from_utf8_lossy(&s).into_owned()
 }
 
-pub fn put(mem: &mut [u8], addr: u32, bytes: &[u8]) {
-    let a = addr as usize;
-    mem[a..a + bytes.len()].copy_from_slice(bytes);
+pub fn put(mem: &mut crate::mem::Mem, addr: u32, bytes: &[u8]) {
+    mem.write_slice(addr, bytes);
 }
 
-pub fn put32(mem: &mut [u8], addr: u32, v: u32) {
+pub fn put32(mem: &mut crate::mem::Mem, addr: u32, v: u32) {
     put(mem, addr, &v.to_le_bytes());
 }
-pub fn put64(mem: &mut [u8], addr: u32, v: u64) {
+pub fn put64(mem: &mut crate::mem::Mem, addr: u32, v: u64) {
     put(mem, addr, &v.to_le_bytes());
 }
 
 /// Fill a kernel stat64 (104 bytes) at `addr` from host metadata.
-pub fn fill_stat64(mem: &mut [u8], addr: u32, md: &std::fs::Metadata) {
-    let a = addr as usize;
-    for b in &mut mem[a..a + 104] {
-        *b = 0;
-    }
+pub fn fill_stat64(mem: &mut crate::mem::Mem, addr: u32, md: &std::fs::Metadata) {
+    mem.zero_range(addr, 104);
     let mut mode = md.mode();
     if md.file_type().is_symlink() {
         // mode() already carries S_IFLNK for symlink metadata.

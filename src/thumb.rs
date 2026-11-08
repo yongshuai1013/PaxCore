@@ -3,10 +3,11 @@
 //! families not yet covered fail loudly via unimp().
 
 use crate::cpu::{Cpu, Step, REG_LR, REG_PC, REG_SP};
+use crate::mem::Mem;
 
-fn rd16(mem: &[u8], addr: u32) -> u32 {
+fn rd16(mem: &Mem, addr: u32) -> u32 {
     let a = addr as usize;
-    u16::from_le_bytes([mem[a], mem[a + 1]]) as u32
+    mem.read_u16(a as u32) as u32
 }
 
 /// ThumbExpandImm: i:imm3:imm8 (12 bits) -> 32-bit constant.
@@ -33,10 +34,23 @@ impl Cpu {
         }
     }
 
-    pub fn step_thumb(&mut self, mem: &mut [u8]) -> Step {
+    pub fn step_thumb(&mut self, mem: &mut Mem) -> Step {
         let pc = self.r[REG_PC];
+        if let Some(out) = self.kuser_call(mem, pc) {
+            return out;
+        }
         let hw = rd16(mem, pc);
         self.steps += 1;
+        if let Some(wp) = self.watch_pc {
+            if pc == wp {
+                eprintln!(
+                    "[watchpc] pc=0x{pc:08x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x} r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x} sp={:#010x} lr={:#010x}",
+                    self.r[0], self.r[1], self.r[2], self.r[3], self.r[4], self.r[5],
+                    self.r[6], self.r[7], self.r[8], self.r[9], self.r[10], self.r[11], self.r[12],
+                    self.r[13], self.r[14]
+                );
+            }
+        }
         if self.trace && self.steps >= self.trace_after {
             eprintln!("[trace] T pc=0x{pc:08x} hw=0x{hw:04x} r0=0x{:08x} r1=0x{:08x}", self.r[0], self.r[1]);
         }
@@ -67,7 +81,7 @@ impl Cpu {
     #[allow(clippy::too_many_arguments)]
     fn exec_thumb(
         &mut self,
-        mem: &mut [u8],
+        mem: &mut Mem,
         pc: u32,
         hw: u32,
         hw2: u32,
@@ -87,13 +101,22 @@ impl Cpu {
         if hw >> 13 == 0 {
             let op = (hw >> 11) & 0x3;
             if op == 3 {
-                // 00011: add/sub
+                // 00011: add/sub. Encoding: bits 8:6 are
+                // Rm (register form) or imm3 (immediate
+                // form); bits 5:3 are Rn. These two fields
+                // were once swapped here, which flipped
+                // every register-form SUB (Rm - Rn) while
+                // ADD stayed invisible (commutative) -- the
+                // GB linker's buffer-space computation
+                // 1a36 subs r6, r6, r0 came out negative
+                // and fed a ~4GB length to memcpy.
+                // guest/subprobe.s pins this.
                 let sub = (hw >> 9) & 1 == 1;
                 let imm_form = (hw >> 10) & 1 == 1;
-                let rn = ((hw >> 6) & 0x7) as usize;
-                let rm = ((hw >> 3) & 0x7) as usize;
+                let rm = ((hw >> 6) & 0x7) as usize;
+                let rn = ((hw >> 3) & 0x7) as usize;
                 let rd = (hw & 0x7) as usize;
-                let b = if imm_form { rn as u32 } else { self.r[rm] };
+                let b = if imm_form { rm as u32 } else { self.r[rm] };
                 let a = self.r[rn];
                 self.r[rd] = if sub {
                     self.sub_with_flags(a, b, 1, sf)
@@ -236,19 +259,19 @@ impl Cpu {
                 1 => {
                     let v = self.r[rd] as u16;
                     let a = addr as usize;
-                    mem[a..a + 2].copy_from_slice(&v.to_le_bytes());
+                    mem.write_u16(a as u32, v);
                 }
                 2 => self.wr8(mem, addr, self.r[rd]),
-                3 => self.r[rd] = mem[addr as usize] as i8 as u32,
+                3 => self.r[rd] = mem.byte(addr) as i8 as u32,
                 4 => self.r[rd] = self.rd(mem, addr),
                 5 => {
                     let a = addr as usize;
-                    self.r[rd] = u16::from_le_bytes([mem[a], mem[a + 1]]) as u32;
+                    self.r[rd] = mem.read_u16(a as u32) as u32;
                 }
                 6 => self.r[rd] = self.rd8(mem, addr),
                 _ => {
                     let a = addr as usize;
-                    self.r[rd] = u16::from_le_bytes([mem[a], mem[a + 1]]) as i16 as u32;
+                    self.r[rd] = (mem.read_u16(a as u32) as i16) as u32;
                 }
             }
             self.r[REG_PC] = next;
@@ -284,7 +307,7 @@ impl Cpu {
                     self.rd8(mem, addr)
                 } else if half {
                     let a = addr as usize;
-                    u16::from_le_bytes([mem[a], mem[a + 1]]) as u32
+                    mem.read_u16(a as u32) as u32
                 } else {
                     self.rd(mem, addr)
                 };
@@ -293,7 +316,7 @@ impl Cpu {
             } else if half {
                 let a = addr as usize;
                 let v = self.r[rd] as u16;
-                mem[a..a + 2].copy_from_slice(&v.to_le_bytes());
+                mem.write_u16(a as u32, v);
             } else {
                 self.wr(mem, addr, self.r[rd]);
             }
@@ -314,8 +337,10 @@ impl Cpu {
         }
         // Misc 16-bit, 1011
         if hw >> 12 == 0xB {
-            if (hw & 0xFF80) == 0xB000 {
-                // ADD/SUB SP, imm7
+            if (hw & 0xFF00) == 0xB000 {
+                // ADD/SUB SP, imm7 (bit7 is the add/sub selector,
+                // so the family mask is 0xFF00 -- an 0xFF80 mask
+                // once let every SUB SP fall through to unimp)
                 let imm = (hw & 0x7F) * 4;
                 if (hw >> 7) & 1 == 1 {
                     self.r[REG_SP] = self.r[REG_SP].wrapping_sub(imm);
@@ -494,7 +519,7 @@ fn expand_imm_carry(imm12: u32, old_c: bool) -> (u32, bool) {
 }
 
 impl Cpu {
-    fn exec_thumb32(&mut self, mem: &mut [u8], pc: u32, hw: u32, hw2: u32) -> Step {
+    fn exec_thumb32(&mut self, mem: &mut Mem, pc: u32, hw: u32, hw2: u32) -> Step {
         let pc4 = pc + 4;
         let next = pc + 4;
         // Hints first: NOP.W/barriers share the branch group's
@@ -507,6 +532,28 @@ impl Cpu {
         // collide with data-processing-immediate (hw2 bit15 = 0).
         if (hw >> 11) == 0x1E {
             let s = (hw >> 10) & 1;
+            if (hw2 & 0xD000) == 0xC000 {
+                // BLX.W: the offset assembly is exactly BL's
+                // (25-bit sign extension, I = !(J ^ S)) -- five
+                // objdump samples pin this down; an extra <<1
+                // here once sent the GB linker into zero memory.
+                // Only the semantics differ: target is an ARM
+                // address, execution leaves Thumb.
+                let j1 = (hw2 >> 13) & 1;
+                let j2 = (hw2 >> 11) & 1;
+                let i1 = 1 - (j1 ^ s);
+                let i2 = 1 - (j2 ^ s);
+                let imm = (s << 24)
+                    | (i1 << 23)
+                    | (i2 << 22)
+                    | ((hw & 0x3FF) << 12)
+                    | ((hw2 & 0x7FF) << 1);
+                let off = ((imm << 7) as i32) >> 7;
+                self.r[REG_LR] = next | 1;
+                self.r[REG_PC] = ((pc4 as i32 + off) as u32) & !3;
+                self.thumb = false;
+                return Step::Continue;
+            }
             if (hw2 & 0xD000) == 0xD000 {
                 // BL
                 let j1 = (hw2 >> 13) & 1;
@@ -539,16 +586,24 @@ impl Cpu {
                 return Step::Continue;
             }
             if (hw2 & 0xD000) == 0x8000 {
-                // B.W conditional
+                // B.W conditional (T3): imm21 =
+                // S:hw2[11]:hw2[13]:imm6:imm11:0 -- the two
+                // hw2 bits land ABOVE imm6, copied directly
+                // (no BL-style inversion). Pinned by five
+                // objdump-verified samples: GB linker
+                // f040 80be -> +0x17c; bwprobe bne.w -8;
+                // bwprobe beq.w +0x4e26 (imm6=4 -> 0x4000);
+                // beq.w +0x40014 has hw2[13] set only;
+                // beq.w +0x80014 has hw2[11] set only.
+                // Two earlier wrong assemblies each broke a
+                // sample above; guest/bwprobe.s pins this.
                 let cond = (hw >> 6) & 0xF;
                 if cond < 0xE && self.cond_ok(cond) {
                     let j1 = (hw2 >> 13) & 1;
                     let j2 = (hw2 >> 11) & 1;
-                    let i1 = 1 - (j1 ^ s);
-                    let i2 = 1 - (j2 ^ s);
                     let imm = (s << 20)
-                        | (i1 << 19)
-                        | (i2 << 18)
+                        | (j2 << 19)
+                        | (j1 << 18)
                         | ((hw & 0x3F) << 12)
                         | ((hw2 & 0x7FF) << 1);
                     let off = ((imm << 11) as i32) >> 11;
@@ -560,6 +615,147 @@ impl Cpu {
                 }
                 return Step::Continue;
             }
+        }
+        // MRC / MCR (coprocessor register transfers):
+        // mirrors the ARM-mode handler in cpu.rs with the
+        // fields extracted from the reassembled 32-bit word.
+        // p15 c13 (opc2 3/4) is the thread pointer -- GB
+        // libc's __libc_preinit reads TPIDRURO (ee1d 0f70)
+        // before anything else. Other p15 accesses are
+        // no-ops (cache/barrier maintenance); other
+        // coprocessors stay unimplemented for now.
+        {
+            let word = (hw << 16) | hw2;
+            if (word >> 26) & 0x3 == 0x3 && (word >> 24) & 0xF == 0xE {
+                let cp = (word >> 8) & 0xF;
+                if cp == 15 {
+                    let crn = (word >> 16) & 0xF;
+                    let crm = word & 0xF;
+                    let opc2 = (word >> 5) & 0x7;
+                    if crn == 13 && crm == 0 && (opc2 == 3 || opc2 == 4) {
+                        let rd = ((word >> 12) & 0xF) as usize;
+                        if (word >> 20) & 1 == 1 {
+                            self.r[rd] = self.tls;
+                        } else {
+                            self.tls = self.r[rd];
+                        }
+                    }
+                    self.r[REG_PC] = next;
+                    return Step::Continue;
+                }
+                self.unimp(hw);
+            }
+        }
+        // Load/store single (Thumb-2): bits 15-9 == 1111100.
+        // Encodings verified against guest/t2ls.s objdump output:
+        // op = hw[11:8] selects size/load/form -- x0-x7 are the
+        // T4 forms (register offset when hw2[11:6]==0, else
+        // pre/post-index with P=hw2.10, U=hw2.9, W=hw2.8,
+        // imm8=hw2[7:0]); x8-xD are unsigned imm12 forms. With
+        // Rn == PC the load forms are literals: base =
+        // Align(PC+4, 4), direction from hw bit7, imm12 = hw2.
+        if (hw >> 9) == 0x7C {
+            // The size/load opcode is hw[7:4], NOT hw[11:8]:
+            // in F8DF the D sits in the third nibble. (Reading
+            // it from [11:8] turned every LDR.W into an STRB and
+            // sent the GB linker walking a corrupted stack.)
+            let op = (hw >> 4) & 0xF;
+            let rn = (hw & 0xF) as usize;
+            let rt = ((hw2 >> 12) & 0xF) as usize;
+            let load = op & 1 == 1;
+            let size = [1u32, 2, 4][((op >> 1) & 3) as usize];
+            let base = if rn == REG_PC { pc4 } else { self.r[rn] };
+            let (eff, writeback) = if rn == REG_PC && load && (op >= 0x8 || (hw2 >> 6) & 0x3F == 0) {
+                let b = pc4 & !3;
+                let imm = (hw2 & 0xFFF) as u32;
+                let e = if (hw >> 7) & 1 == 1 {
+                    b.wrapping_add(imm)
+                } else {
+                    b.wrapping_sub(imm)
+                };
+                (e, None)
+            } else if op >= 0x8 {
+                (base.wrapping_add((hw2 & 0xFFF) as u32), None)
+            } else if (hw2 >> 6) & 0x3F == 0 {
+                let rm = (hw2 & 0xF) as usize;
+                let shift = (hw2 >> 4) & 0x3;
+                let rv = if rm == REG_PC { pc4 } else { self.r[rm] };
+                (base.wrapping_add(rv << shift), None)
+            } else {
+                let pre = (hw2 >> 10) & 1 == 1;
+                let up = (hw2 >> 9) & 1 == 1;
+                let wb = (hw2 >> 8) & 1 == 1;
+                let imm = (hw2 & 0xFF) as u32;
+                let off_addr = if up {
+                    base.wrapping_add(imm)
+                } else {
+                    base.wrapping_sub(imm)
+                };
+                let e = if pre { off_addr } else { base };
+                let w = if wb || !pre { Some(off_addr) } else { None };
+                (e, w)
+            };
+            if load {
+                let val = match size {
+                    1 => self.rd8(mem, eff),
+                    2 => mem.read_u16(eff) as u32,
+                    _ => self.rd(mem, eff),
+                };
+                if rt == REG_PC {
+                    self.thumb = val & 1 == 1;
+                    self.r[REG_PC] = val & !1;
+                    return Step::Continue;
+                }
+                self.r[rt] = val;
+            } else {
+                let val = self.r[rt];
+                match size {
+                    1 => self.wr8(mem, eff, val),
+                    2 => mem.write_u16(eff, val as u16),
+                    _ => self.wr(mem, eff, val),
+                }
+            }
+            if let Some(nv) = writeback {
+                if !(load && rn == rt) {
+                    self.r[rn] = nv;
+                }
+            }
+            self.r[REG_PC] = next;
+            return Step::Continue;
+        }
+        // TBB / TBH: (hw & 0xFFF0) == 0xE8D0 with hw2 ==
+        // 1111 0000 000 L Rm (L = hw2 bit 4 selects halfword
+        // entries). Table base is the architectural PC
+        // (instruction address + 4) when Rn == PC, else Rn.
+        // Must be claimed before LDM/STM wide below, whose
+        // encoding space this shares: falling into the LDRD
+        // decode for e8df f013 silently scrambled registers
+        // in the GB linker's printf size dispatch, after
+        // which the CPU executed the jump table itself as
+        // code (its 0x000f entry zeroed r7 via movs r7, r1).
+        // Field layout pinned against the linker's own TBH
+        // (0xb00055e8, table verified entry by entry) and
+        // guest/tbprobe.s.
+        if (hw & 0xFFF0) == 0xE8D0 && (hw2 & 0xFFE0) == 0xF000 {
+            let rn = (hw & 0xF) as usize;
+            let rm = (hw2 & 0xF) as usize;
+            let base = if rn == REG_PC { pc4 } else { self.r[rn] };
+            let idx = self.r[rm];
+            let off = if (hw2 >> 4) & 1 == 1 {
+                mem.read_u16(base.wrapping_add(idx.wrapping_mul(2))) as u32 * 2
+            } else {
+                // TBB bytes are halfword units too (target =
+                // base + 2 * byte), NOT raw byte offsets --
+                // pinned by a clang-generated switch table
+                // (tbb at +8, table bytes 05 11 0b 0d...,
+                // case targets at base + 2*byte) and by the
+                // GB linker's tag dispatch (0xb0004b88),
+                // whose 0xab default entries only reach the
+                // loop-advance block at base + 0x156.
+                mem.byte(base.wrapping_add(idx)) as u32 * 2
+            };
+            self.r[REG_PC] = base.wrapping_add(off);
+            return Step::Continue;
         }
         // LDM/STM wide: bits 15-9 == 1110100; bit 6 set marks the
         // dual (LDRD/STRD) sub-space instead.
@@ -709,6 +905,33 @@ impl Cpu {
             }
             return Step::Continue;
         }
+        // Shift by register (Thumb-2): hw == 0xFAxx, verified
+        // against guest/t2dp.s -- type = hw[6:5] (LSL/LSR/ASR/
+        // ROR in shift_reg numbering), S = hw[4], source =
+        // hw[3:0], Rd = hw2[11:8], amount register = hw2[3:0],
+        // marked by hw2[15:12] == 1111. The GB linker uses
+        // LSRS.W in its table walks.
+        if (hw >> 8) == 0xFA && (hw2 >> 12) == 0xF {
+            let typ = (hw >> 5) & 0x3;
+            let set = (hw >> 4) & 1 == 1;
+            let rn = (hw & 0xF) as usize;
+            let rd = ((hw2 >> 8) & 0xF) as usize;
+            let rm = (hw2 & 0xF) as usize;
+            let raw = if rn == REG_PC { pc4 } else { self.r[rn] };
+            let amt = self.r[rm] & 0xFF;
+            let (val, carry) = self.shift_reg(raw, typ, amt);
+            if set {
+                self.set_nz(val);
+                self.c = carry;
+            }
+            if rd == REG_PC {
+                self.jump_to(val);
+            } else {
+                self.r[rd] = val;
+                self.r[REG_PC] = next;
+            }
+            return Step::Continue;
+        }
         // Data processing (register): bits 15-9 == 1110101
         if (hw >> 9) == 0x75 {
             let opc = (hw >> 5) & 0xF;
@@ -764,72 +987,161 @@ impl Cpu {
                 self.r[REG_PC] = next;
                 return Step::Continue;
             }
-            let op = (hw >> 5) & 0xF;
+            // Opcode fields verified against NDK-assembled encodings
+            // (guest mulprobe): opA = hw1[7:4], opB = hw2[7:4]. The old
+            // key (hw >> 5) merged prefix bit8 into the opcode, which
+            // sent MLA (FB0E) to the MLS arm and SDIV/UDIV to SMULL/UMULL.
+            let opa = (hw >> 4) & 0xF;
+            let opb = (hw2 >> 4) & 0xF;
             let rn = (hw & 0xF) as usize;
             let ra = ((hw2 >> 12) & 0xF) as usize;
             let rd = ((hw2 >> 8) & 0xF) as usize;
             let rm = (hw2 & 0xF) as usize;
-            match op {
-                0x8 => {
+            let half = |v: u32, top: bool| -> i32 {
+                if top {
+                    (v >> 16) as i16 as i32
+                } else {
+                    v as i16 as i32
+                }
+            };
+            match (opa, opb) {
+                (0x0, 0x0) => {
                     if ra == 15 {
                         // MUL
                         self.r[rd] = self.r[rn].wrapping_mul(self.r[rm]);
                     } else {
-                        // MLS: Rd = Ra - Rn * Rm
-                        self.r[rd] = self.r[ra]
-                            .wrapping_sub(self.r[rn].wrapping_mul(self.r[rm]));
-                    }
-                }
-                0x9 => {
-                    if (hw & 0xF0) == 0x90 {
-                        // SDIV (marker verified vs enc2.s: hw1 0xFB91)
-                        let d = self.r[rm] as i32;
-                        self.r[rd] = if d == 0 {
-                            0
-                        } else {
-                            ((self.r[rn] as i32).wrapping_div(d)) as u32
-                        };
-                    } else {
-                        // MLA
+                        // MLA: Rd = Rn * Rm + Ra
                         self.r[rd] = self.r[rn]
                             .wrapping_mul(self.r[rm])
                             .wrapping_add(self.r[ra]);
                     }
                 }
-                0xB => {
-                    if (hw & 0xF0) == 0x90 {
-                        // UDIV (marker verified: hw1 0xFBB1)
-                        let d = self.r[rm];
-                        self.r[rd] = if d == 0 { 0 } else { self.r[rn] / d };
-                    } else {
-                        self.unimp(hw);
-                    }
+                (0x0, 0x1) => {
+                    // MLS: Rd = Ra - Rn * Rm
+                    self.r[rd] = self.r[ra]
+                        .wrapping_sub(self.r[rn].wrapping_mul(self.r[rm]));
                 }
-                0xC => {
-                    // SMULL: RdLo = hw2[15:12], RdHi = rd field
+                (0x1, _) => {
+                    // SMULxy / SMLAxy: opB[1] = Rn top, opB[0] = Rm top
+                    let p = half(self.r[rn], opb & 2 != 0)
+                        .wrapping_mul(half(self.r[rm], opb & 1 != 0));
+                    self.r[rd] = if ra == 15 {
+                        p as u32
+                    } else {
+                        p.wrapping_add(self.r[ra] as i32) as u32
+                    };
+                }
+                (0x2, _) => {
+                    // SMUAD / SMLAD (opB[0]: exchange Rm halves)
+                    let (a, b) = if opb & 1 != 0 {
+                        (half(self.r[rm], true), half(self.r[rm], false))
+                    } else {
+                        (half(self.r[rm], false), half(self.r[rm], true))
+                    };
+                    let p = half(self.r[rn], false)
+                        .wrapping_mul(a)
+                        .wrapping_add(half(self.r[rn], true).wrapping_mul(b));
+                    self.r[rd] = if ra == 15 {
+                        p as u32
+                    } else {
+                        p.wrapping_add(self.r[ra] as i32) as u32
+                    };
+                }
+                (0x3, _) => {
+                    // SMULW / SMLAW: bits [47:16] of Rn * half(Rm)
+                    let p = (self.r[rn] as i32 as i64 * half(self.r[rm], opb & 1 != 0) as i64) >> 16;
+                    self.r[rd] = if ra == 15 {
+                        p as u32
+                    } else {
+                        (p as u32).wrapping_add(self.r[ra])
+                    };
+                }
+                (0x4, _) => {
+                    // SMUSD / SMLSD (opB[0]: exchange Rm halves)
+                    let (a, b) = if opb & 1 != 0 {
+                        (half(self.r[rm], true), half(self.r[rm], false))
+                    } else {
+                        (half(self.r[rm], false), half(self.r[rm], true))
+                    };
+                    let p = half(self.r[rn], false)
+                        .wrapping_mul(a)
+                        .wrapping_sub(half(self.r[rn], true).wrapping_mul(b));
+                    self.r[rd] = if ra == 15 {
+                        p as u32
+                    } else {
+                        p.wrapping_add(self.r[ra] as i32) as u32
+                    };
+                }
+                (0x5, _) | (0x6, _) => {
+                    // SMMLA / SMMUL (opA 5), SMMLS (opA 6); opB[0] = round
+                    let prod = self.r[rn] as i32 as i64 * self.r[rm] as i32 as i64;
+                    let adj = if opb & 1 != 0 {
+                        (prod as u64).wrapping_add(0x8000_0000) as i64
+                    } else {
+                        prod
+                    };
+                    let hi = (adj >> 32) as u32;
+                    self.r[rd] = if opa == 6 {
+                        self.r[ra].wrapping_sub(hi)
+                    } else if ra == 15 {
+                        hi
+                    } else {
+                        hi.wrapping_add(self.r[ra])
+                    };
+                }
+                (0x9, 0xF) => {
+                    // SDIV (encoding verified: hw1 0xFB91, hw2[7:4] = 0xF)
+                    let d = self.r[rm] as i32;
+                    self.r[rd] = if d == 0 {
+                        0
+                    } else {
+                        ((self.r[rn] as i32).wrapping_div(d)) as u32
+                    };
+                }
+                (0xB, 0xF) => {
+                    // UDIV (encoding verified: hw1 0xFBB1, hw2[7:4] = 0xF)
+                    let d = self.r[rm];
+                    self.r[rd] = if d == 0 { 0 } else { self.r[rn] / d };
+                }
+                (0x8, 0x0) => {
+                    // SMULL: RdLo = hw2[15:12] (ra), RdHi = rd field
                     let res = (self.r[rn] as i32 as i64 * self.r[rm] as i32 as i64) as u64;
                     self.r[ra] = res as u32;
                     self.r[rd] = (res >> 32) as u32;
                 }
-                0xD => {
+                (0xA, 0x0) => {
                     // UMULL
                     let res = self.r[rn] as u64 * self.r[rm] as u64;
                     self.r[ra] = res as u32;
                     self.r[rd] = (res >> 32) as u32;
                 }
-                0xE => {
-                    // SMLAL
+                (0xC, _) => {
+                    // SMLAL (opB 0) / SMLALxy (opB 8..=11)
                     let acc = ((self.r[rd] as u64) << 32) | self.r[ra] as u64;
-                    let res = (acc as i64
-                        + self.r[rn] as i32 as i64 * self.r[rm] as i32 as i64)
-                        as u64;
+                    let res = if opb & 8 != 0 {
+                        let p = half(self.r[rn], opb & 2 != 0)
+                            .wrapping_mul(half(self.r[rm], opb & 1 != 0));
+                        (acc as i64 + p as i64) as u64
+                    } else if opb == 0 {
+                        (acc as i64 + self.r[rn] as i32 as i64 * self.r[rm] as i32 as i64) as u64
+                    } else {
+                        self.unimp(hw)
+                    };
                     self.r[ra] = res as u32;
                     self.r[rd] = (res >> 32) as u32;
                 }
-                0xF => {
+                (0xE, 0x0) => {
                     // UMLAL
                     let acc = ((self.r[rd] as u64) << 32) | self.r[ra] as u64;
                     let res = acc + self.r[rn] as u64 * self.r[rm] as u64;
+                    self.r[ra] = res as u32;
+                    self.r[rd] = (res >> 32) as u32;
+                }
+                (0xE, 0x6) => {
+                    // UMAAL: RdHi:RdLo = Rn * Rm + RdLo + RdHi
+                    let res = self.r[rn] as u64 * self.r[rm] as u64
+                        + self.r[ra] as u64
+                        + self.r[rd] as u64;
                     self.r[ra] = res as u32;
                     self.r[rd] = (res >> 32) as u32;
                 }
@@ -908,14 +1220,14 @@ impl Cpu {
                 }
                 let val = match (size, signed) {
                     (0, false) => self.rd8(mem, addr),
-                    (0, true) => mem[addr as usize] as i8 as u32,
+                    (0, true) => mem.byte(addr) as i8 as u32,
                     (1, false) => {
                         let a = addr as usize;
-                        u16::from_le_bytes([mem[a], mem[a + 1]]) as u32
+                        mem.read_u16(a as u32) as u32
                     }
                     (1, true) => {
                         let a = addr as usize;
-                        u16::from_le_bytes([mem[a], mem[a + 1]]) as i16 as u32
+                        (mem.read_u16(a as u32) as i16) as u32
                     }
                     _ => self.rd(mem, addr),
                 };
@@ -932,7 +1244,7 @@ impl Cpu {
                     0 => self.wr8(mem, addr, val),
                     1 => {
                         let a = addr as usize;
-                        mem[a..a + 2].copy_from_slice(&(val as u16).to_le_bytes());
+                        mem.write_u16(a as u32, val as u16);
                     }
                     _ => self.wr(mem, addr, val),
                 }

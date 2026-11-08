@@ -10,6 +10,7 @@
 //! they are the M2 milestone.
 
 use crate::cpu::Cpu;
+use crate::mem::Mem;
 use crate::fs::{fill_stat64, put, put32, put64, read_guest_str, Fd, FdKind, GuestFs};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{DirEntryExt, MetadataExt};
@@ -101,6 +102,13 @@ pub struct Syscalls {
     seen: std::collections::HashSet<u32>,
     brk: u32,
     mmap_next: u32,
+    /// Live mmap intervals (base, len), page aligned. GB
+    /// binaries are prelinked: the linker demands exact load
+    /// addresses via mmap hints, so hint-less bump allocation
+    /// alone cannot serve it -- the intervals also decide
+    /// whether a hinted address is free and what MAP_FIXED /
+    /// munmap replace.
+    maps: Vec<(u32, u32)>,
     rng: u64,
     /// This process's pid / parent pid (scheduler-assigned).
     pub pid: u32,
@@ -112,6 +120,9 @@ pub struct Syscalls {
     /// our re-issue futex model performs implicitly) when this
     /// thread exits.
     pub tid_addr: u32,
+    /// Guest path of the current program image (what
+    /// /proc/self/exe resolves to). Set at startup and on exec.
+    pub exe_path: String,
     /// Signal dispositions + group pending signals, shared by
     /// CLONE_SIGHAND threads.
     pub sighand: std::rc::Rc<std::cell::RefCell<SigShared>>,
@@ -141,11 +152,11 @@ fn now_unix() -> (u64, u32) {
     (d.as_secs(), d.subsec_nanos())
 }
 
-fn fill_stat64_stdio(mem: &mut [u8], addr: u32) {
+fn fill_stat64_stdio(mem: &mut Mem, addr: u32) {
     let a = addr as usize;
-    for b in &mut mem[a..a + 104] {
-        *b = 0;
-    }
+    mem.zero_range(addr, 104);
+    let a = addr as usize;
+    let _ = a;
     put32(mem, addr + 16, 0o020000 | 0o600); // S_IFCHR | rw-------
     put32(mem, addr + 24, 1000);
     put32(mem, addr + 28, 1000);
@@ -159,11 +170,13 @@ impl Syscalls {
             .map(|d| (d.as_nanos() as u64) ^ 0x9e37_79b9_7f4a_7c15)
             .unwrap_or(0x2545_f491);
         Syscalls {
+            exe_path: String::new(),
             fs: GuestFs::new(rootfs),
             log_unimplemented: true,
             seen: std::collections::HashSet::new(),
             brk: (image_end + 0xFFF) & !0xFFF,
             mmap_next: MAP_BASE,
+            maps: Vec::new(),
             rng: seed | 1,
             pid: 100,
             ppid: 99,
@@ -182,6 +195,36 @@ impl Syscalls {
     pub fn reset_exec(&mut self, image_end: u32) {
         self.brk = (image_end + 0xFFF) & !0xFFF;
         self.mmap_next = MAP_BASE;
+        self.maps.clear();
+    }
+
+    /// Is [base, base+len) disjoint from every live interval?
+    fn range_free(&self, base: u32, len: u32) -> bool {
+        let end = base.wrapping_add(len);
+        self.maps
+            .iter()
+            .all(|&(b, l)| b.wrapping_add(l) <= base || b >= end)
+    }
+
+    /// Drop [base, base+len) from the interval list, trimming
+    /// partial overlaps the way munmap/MAP_FIXED replacement do.
+    fn unmap_range(&mut self, base: u32, len: u32) {
+        let end = base.wrapping_add(len);
+        let mut out = Vec::with_capacity(self.maps.len());
+        for &(b, l) in &self.maps {
+            let e = b.wrapping_add(l);
+            if e <= base || b >= end {
+                out.push((b, l));
+            } else {
+                if b < base {
+                    out.push((b, base - b));
+                }
+                if e > end {
+                    out.push((end, e - end));
+                }
+            }
+        }
+        self.maps = out;
     }
 
     /// Duplicate this syscall state for a fork child. Open files
@@ -215,6 +258,7 @@ impl Syscalls {
             );
         }
         Syscalls {
+            exe_path: self.exe_path.clone(),
             fs: crate::fs::GuestFs {
                 root: self.fs.root.clone(),
                 cwd: self.fs.cwd.clone(),
@@ -224,6 +268,7 @@ impl Syscalls {
             seen: self.seen.clone(),
             brk: self.brk,
             mmap_next: self.mmap_next,
+            maps: self.maps.clone(),
             rng: self.rng,
             pid: child_pid,
             ppid: self.pid,
@@ -307,7 +352,7 @@ impl Syscalls {
         }
     }
 
-    fn do_stat(&mut self, mem: &mut [u8], fd_or: Option<i32>, path: &str, buf: u32, follow: bool) -> u32 {
+    fn do_stat(&mut self, mem: &mut Mem, fd_or: Option<i32>, path: &str, buf: u32, follow: bool) -> u32 {
         let md = if let Some(fd) = fd_or {
             match self.fs.fds.get(&fd).map(|f| &f.kind) {
                 Some(FdKind::File(f)) => match f.metadata() {
@@ -348,7 +393,7 @@ impl Syscalls {
         0
     }
 
-    pub fn handle(&mut self, cpu: &mut Cpu, mem: &mut [u8]) -> Outcome {
+    pub fn handle(&mut self, cpu: &mut Cpu, mem: &mut Mem) -> Outcome {
         let nr = cpu.r[7];
         if std::env::var_os("PAXCORE_TRACE").is_some() {
             let path_note = match nr {
@@ -426,9 +471,7 @@ impl Syscalls {
                 let op = a1 & 0x7F;
                 if op == 0 || op == 9 {
                     if (a0 as usize) + 4 <= mem.len() {
-                        let cur = u32::from_le_bytes(
-                            mem[a0 as usize..a0 as usize + 4].try_into().unwrap(),
-                        );
+                        let cur = mem.read_u32(a0);
                         if cur != a2 {
                             return done(cpu, err(11)); // EAGAIN
                         }
@@ -481,7 +524,7 @@ impl Syscalls {
                 let mut tmp = vec![0u8; count];
                 match fd.read(&mut tmp) {
                     Ok(n) => {
-                        mem[buf..buf + n].copy_from_slice(&tmp[..n]);
+                        mem.write_slice(buf as u32, &tmp[..n]);
                         n as u32
                     }
                     Err(e) => io_err(&e),
@@ -501,7 +544,7 @@ impl Syscalls {
                 if buf + count > mem.len() {
                     return done(cpu, err(EFAULT));
                 }
-                let data = mem[buf..buf + count].to_vec();
+                let data = { let mut v = vec![0u8; count]; mem.read_slice(buf as u32, &mut v); v };
                 match self.fs.fds.get_mut(&(a0 as i32)) {
                     Some(fd) => match fd.write(&data) {
                         Ok(n) => n as u32,
@@ -592,9 +635,9 @@ fn done(cpu: &mut Cpu, v: u32) -> Outcome {
 
 /// Kernel sigaction (ARM) serialization: handler, flags,
 /// restorer, mask as two u32s -- 20 bytes at `addr`.
-fn read_sigaction(mem: &[u8], addr: u32) -> SigAction {
+fn read_sigaction(mem: &Mem, addr: u32) -> SigAction {
     let a = addr as usize;
-    let w = |o: usize| u32::from_le_bytes(mem[a + o..a + o + 4].try_into().unwrap());
+    let w = |o: usize| mem.read_u32((a + o) as u32);
     SigAction {
         handler: w(0),
         flags: w(4),
@@ -603,7 +646,7 @@ fn read_sigaction(mem: &[u8], addr: u32) -> SigAction {
     }
 }
 
-fn write_sigaction(mem: &mut [u8], addr: u32, act: &SigAction) {
+fn write_sigaction(mem: &mut Mem, addr: u32, act: &SigAction) {
     put32(mem, addr, act.handler);
     put32(mem, addr + 4, act.flags);
     put32(mem, addr + 8, act.restorer);
@@ -613,7 +656,7 @@ fn write_sigaction(mem: &mut [u8], addr: u32, act: &SigAction) {
 /// Read a guest NULL-terminated array of string pointers (argv /
 /// envp for execve). Defensive: a null array pointer yields an
 /// empty vec, unreadable entries end the list.
-fn read_str_array(mem: &[u8], ptr: u32) -> Vec<String> {
+fn read_str_array(mem: &Mem, ptr: u32) -> Vec<String> {
     let mut out = Vec::new();
     if ptr == 0 {
         return out;
@@ -623,7 +666,7 @@ fn read_str_array(mem: &[u8], ptr: u32) -> Vec<String> {
         if a + 4 > mem.len() {
             break;
         }
-        let p = u32::from_le_bytes(mem[a..a + 4].try_into().unwrap());
+        let p = mem.read_u32(a as u32);
         if p == 0 {
             break;
         }
@@ -633,7 +676,7 @@ fn read_str_array(mem: &[u8], ptr: u32) -> Vec<String> {
 }
 
 impl Syscalls {
-    fn handle2(&mut self, cpu: &mut Cpu, mem: &mut [u8], nr: u32) -> u32 {
+    fn handle2(&mut self, cpu: &mut Cpu, mem: &mut Mem, nr: u32) -> u32 {
         let (a0, a1, a2, a3, a4) = (cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4]);
         match nr {
             42 | 331 => {
@@ -673,9 +716,7 @@ impl Syscalls {
                     if a0 > self.brk {
                         let (s, e) = (self.brk as usize, a0 as usize);
                         if e <= mem.len() {
-                            for b in &mut mem[s..e] {
-                                *b = 0;
-                            }
+                            mem.zero_range(s as u32, e - s);
                         }
                     }
                     self.brk = a0;
@@ -771,7 +812,7 @@ impl Syscalls {
 
 impl Syscalls {
     #[allow(clippy::too_many_arguments)]
-    fn handle3(&mut self, cpu: &mut Cpu, mem: &mut [u8], nr: u32) -> u32 {
+    fn handle3(&mut self, cpu: &mut Cpu, mem: &mut Mem, nr: u32) -> u32 {
         let (a0, a1, a2, a3, a4) = (cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4]);
         match nr {
             78 => {
@@ -806,12 +847,10 @@ impl Syscalls {
                     return err(EFAULT);
                 }
                 let fields = ["Linux", "paxcore", "2.6.29", "paxcore-1", "armv7l", ""];
+                mem.zero_range(a0, 65 * 6);
                 for (i, f) in fields.iter().enumerate() {
                     let base = a0 as usize + i * 65;
-                    for b in &mut mem[base..base + 65] {
-                        *b = 0;
-                    }
-                    mem[base..base + f.len()].copy_from_slice(f.as_bytes());
+                    mem.write_slice(base as u32, f.as_bytes());
                 }
                 0
             }
@@ -845,17 +884,13 @@ impl Syscalls {
                 }
                 let mut total = 0usize;
                 for i in 0..iovcnt as usize {
-                    let base = u32::from_le_bytes(
-                        mem[iov + i * 8..iov + i * 8 + 4].try_into().unwrap(),
-                    ) as usize;
-                    let len = u32::from_le_bytes(
-                        mem[iov + i * 8 + 4..iov + i * 8 + 8].try_into().unwrap(),
-                    ) as usize;
+                    let base = mem.read_u32((iov + i * 8) as u32) as usize;
+                    let len = mem.read_u32((iov + i * 8 + 4) as u32) as usize;
                     if base + len > mem.len() {
                         return err(EFAULT);
                     }
                     if is_write {
-                        let data = mem[base..base + len].to_vec();
+                        let data = { let mut v = vec![0u8; len]; mem.read_slice(base as u32, &mut v); v };
                         match self.fs.fds.get_mut(&(a0 as i32)) {
                             Some(fd) => match fd.write(&data) {
                                 Ok(n) => total += n,
@@ -871,7 +906,7 @@ impl Syscalls {
                                 let mut tmp = vec![0u8; len];
                                 match fd.read(&mut tmp) {
                                     Ok(n) => {
-                                        mem[base..base + n].copy_from_slice(&tmp[..n]);
+                                        mem.write_slice(base as u32, &tmp[..n]);
                                         total += n;
                                         if n < len {
                                             break;
@@ -898,7 +933,8 @@ impl Syscalls {
                 for set_ptr in [a1, a2, a3] {
                     if set_ptr != 0 && (set_ptr as usize) + 4 <= mem.len() {
                         let w = u32::from_le_bytes(
-                            mem[set_ptr as usize..set_ptr as usize + 4]
+                            mem.read_u32(set_ptr).to_le_bytes()
+                                .as_slice()
                                 .try_into()
                                 .unwrap(),
                         );
@@ -917,9 +953,9 @@ impl Syscalls {
                 }
                 for i in 0..nfds {
                     let ev_off = base + i * 8 + 6;
-                    let ev = u16::from_le_bytes([mem[ev_off - 2], mem[ev_off - 1]]);
-                    mem[ev_off] = (ev & 0x5) as u8; // POLLIN|POLLOUT subset
-                    mem[ev_off + 1] = 0;
+                    let ev = mem.read_u16((ev_off - 2) as u32);
+                    mem.set_byte(ev_off as u32, (ev & 0x5) as u8); // POLLIN|POLLOUT subset
+                    mem.set_byte((ev_off + 1) as u32, 0);
                 }
                 nfds as u32
             }
@@ -951,7 +987,7 @@ impl Syscalls {
                 }
                 if a1 != 0 {
                     let v = u64::from_le_bytes(
-                        mem[a1 as usize..a1 as usize + 8].try_into().unwrap(),
+                        mem.read_u64(a1).to_le_bytes(),
                     );
                     // SIGKILL(9) and SIGSTOP(19) can never block.
                     let v = v & !(1u64 << 8) & !(1u64 << 18);
@@ -982,7 +1018,7 @@ impl Syscalls {
                     return err(EFAULT);
                 }
                 put(mem, a0, self.fs.cwd.as_bytes());
-                mem[a0 as usize + need - 1] = 0;
+                mem.set_byte(a0 + (need - 1) as u32, 0);
                 need as u32
             }
             _ => self.handle4(cpu, mem, nr),
@@ -991,22 +1027,49 @@ impl Syscalls {
 }
 
 impl Syscalls {
-    fn handle4(&mut self, cpu: &mut Cpu, mem: &mut [u8], nr: u32) -> u32 {
+    fn handle4(&mut self, cpu: &mut Cpu, mem: &mut Mem, nr: u32) -> u32 {
         let (a0, a1, a2, a3, a4, a5) = (
             cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4], cpu.r[5],
         );
         match nr {
             192 => {
-                // mmap2(addr, len, prot, flags, fd, pgoffset)
-                let len = ((a1 + 0xFFF) & !0xFFF) as usize;
-                let base = self.mmap_next as usize;
-                if base + len > mem.len() {
-                    return err(12); // ENOMEM
+                // mmap2(addr, len, prot, flags, fd, pgoffset).
+                // A non-null addr is honored when the range is
+                // free (Linux hint semantics); MAP_FIXED forces
+                // it. Honoring hints is load-bearing for GB:
+                // its libraries are prelinked and the linker
+                // reserves each at its assigned address
+                // (liblog.so at 0xafa00000) and aborts if the
+                // mapping lands anywhere else.
+                let len = (a1 + 0xFFF) & !0xFFF;
+                if len == 0 {
+                    return err(22); // EINVAL
                 }
-                self.mmap_next += len as u32;
-                for b in &mut mem[base..base + len] {
-                    *b = 0;
-                }
+                let fixed = a3 & 0x10 != 0;
+                let want = a0 & !0xFFF;
+                let base = if fixed && want != 0 {
+                    self.unmap_range(want, len);
+                    want
+                } else if want != 0 && self.range_free(want, len) {
+                    want
+                } else {
+                    let mut b = self.mmap_next;
+                    while !self.range_free(b, len) {
+                        match self.maps.iter().find(|&&(mb, ml)| {
+                            let me = mb.wrapping_add(ml);
+                            me > b && mb < b.wrapping_add(len)
+                        }) {
+                            Some(&(mb, ml)) => {
+                                b = (mb.wrapping_add(ml) + 0xFFF) & !0xFFF;
+                            }
+                            None => break,
+                        }
+                    }
+                    self.mmap_next = b.wrapping_add(len);
+                    b
+                };
+                self.maps.push((base, len));
+                mem.zero_range(base, len as usize);
                 let anon = a3 & 0x20 != 0 || a4 as i32 == -1;
                 if !anon {
                     if let Some(fd) = self.fs.fds.get_mut(&(a4 as i32)) {
@@ -1015,20 +1078,35 @@ impl Syscalls {
                             if f.seek(SeekFrom::Start(off)).is_ok() {
                                 let want = a1 as usize;
                                 let mut n = 0usize;
+                                let mut tmpbuf = vec![0u8; want];
                                 while n < want {
-                                    match f.read(&mut mem[base + n..base + want]) {
+                                    match f.read(&mut tmpbuf[n..want]) {
                                         Ok(0) => break,
                                         Ok(k) => n += k,
                                         Err(_) => break,
                                     }
                                 }
+                                mem.write_slice(base, &tmpbuf[..n]);
                             }
                         }
                     } else {
                         return err(EBADF);
                     }
                 }
-                base as u32
+                base
+            }
+            91 => {
+                // munmap(addr, len): drop the interval and
+                // clear the bytes so a later mapping never
+                // observes stale contents.
+                let len = (a1 + 0xFFF) & !0xFFF;
+                let base = a0 & !0xFFF;
+                if len == 0 {
+                    return err(22); // EINVAL
+                }
+                self.unmap_range(base, len);
+                mem.zero_range(base, len as usize);
+                0
             }
             195 => {
                 let p = read_guest_str(mem, a0);
@@ -1040,6 +1118,26 @@ impl Syscalls {
             }
             197 => self.do_stat(mem, Some(a0 as i32), "", a1, true),
             217 => self.do_getdents(mem, a0 as i32, a1, a2),
+            67 => {
+                // readlink(path, buf, bufsiz)
+                let p = read_guest_str(mem, a0);
+                let target = if p == "/proc/self/exe" || p == "/proc/thread-self/exe" {
+                    Some(self.exe_path.clone())
+                } else {
+                    let host = self.fs.host_path(&p);
+                    std::fs::read_link(&host)
+                        .ok()
+                        .map(|t| t.to_string_lossy().into_owned())
+                };
+                match target {
+                    Some(t) => {
+                        let n = t.len().min(a2 as usize);
+                        put(mem, a1, &t.as_bytes()[..n]);
+                        n as u32
+                    }
+                    None => err(22), // EINVAL: not a symlink
+                }
+            }
             263 => {
                 // clock_gettime(clk, ts*)
                 let (secs, nanos) = now_unix();
@@ -1086,7 +1184,7 @@ impl Syscalls {
                     if i % 8 == 0 {
                         self.next_rand();
                     }
-                    mem[buf + i] = (self.rng >> ((i % 8) * 8)) as u8;
+                    mem.set_byte((buf + i) as u32, (self.rng >> ((i % 8) * 8)) as u8);
                 }
                 len as u32
             }
@@ -1105,7 +1203,7 @@ impl Syscalls {
         }
     }
 
-    fn do_getdents(&mut self, mem: &mut [u8], fdnum: i32, buf: u32, count: u32) -> u32 {
+    fn do_getdents(&mut self, mem: &mut Mem, fdnum: i32, buf: u32, count: u32) -> u32 {
         let fd = match self.fs.fds.get_mut(&fdnum) {
             Some(f) => f,
             None => return err(EBADF),
@@ -1158,9 +1256,9 @@ impl Syscalls {
             put64(mem, (off) as u32, *ino);
             put64(mem, (off + 8) as u32, (idx + 1) as u64);
             put(mem, (off + 16) as u32, &(reclen as u16).to_le_bytes());
-            mem[off + 18] = *dt;
+            mem.set_byte((off + 18) as u32, *dt);
             put(mem, (off + 19) as u32, name.as_bytes());
-            mem[off + 19 + name.len()] = 0;
+            mem.set_byte((off + 19 + name.len()) as u32, 0);
             written += reclen;
             idx += 1;
         }
