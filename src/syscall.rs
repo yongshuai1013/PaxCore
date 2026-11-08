@@ -1016,6 +1016,13 @@ impl Syscalls {
             // PaxCore's credential world is a single uid, so
             // accept and succeed like the pair above.
             203 | 204 | 208 | 210 => 0,
+            // getpriority (96): kernel-style scale where 20 is
+            // nice 0; bionic's wrapper maps it back. Zygote's
+            // preload path queries it and carries on either way.
+            96 => 20,
+            // madvise (220): pure performance advice; accepting
+            // it changes no semantics.
+            220 => 0,
             64 => self.ppid,    // getppid
             224 => self.pid,    // gettid (no threads yet: tid == pid)
             _ => self.handle2(cpu, mem, nr),
