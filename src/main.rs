@@ -207,10 +207,25 @@ fn main() {
             d.execfn = guest_argv[0].clone();
         }
     }
+    let mut guest_env: Vec<String> = vec![
+        "PATH=/bin:/usr/bin".into(),
+        "HOME=/".into(),
+        "TERM=dumb".into(),
+    ];
+    // Extra guest environment for bring-up runs (services
+    // normally get theirs from init): PAXCORE_GUEST_ENV holds
+    // ';'-separated KEY=VAL pairs.
+    if let Ok(extra) = std::env::var("PAXCORE_GUEST_ENV") {
+        for kv in extra.split(';') {
+            if kv.contains('=') {
+                guest_env.push(kv.to_string());
+            }
+        }
+    }
     let sp = build_stack(
         &mut mem,
         &guest_argv,
-        &["PATH=/bin:/usr/bin".into(), "HOME=/".into(), "TERM=dumb".into()],
+        &guest_env,
         loaded.dyn_aux.as_ref(),
     );
     let mut cpu = Cpu::new(loaded.start_entry & !1, sp);
@@ -346,6 +361,28 @@ impl Scheduler {
         loop {
             if self.total_steps >= max_steps() {
                 eprintln!("[paxcore] step limit reached");
+                for p in &self.procs {
+                    eprintln!(
+                        "[paxcore]   pid {} tgid {} steps {} zombie {:?} pc 0x{:08x}",
+                        p.pid, p.tgid, p.cpu.steps, p.zombie, p.cpu.r[15]
+                    );
+                    if let Ok(spec) = std::env::var("PAXCORE_DUMP") {
+                        let mut it = spec.split(':');
+                        if let (Some(range), Some(path)) = (it.next(), it.next()) {
+                            let mut ab = range.split('-');
+                            let s = u32::from_str_radix(ab.next().unwrap_or("0"), 16)
+                                .unwrap_or(0);
+                            let e = u32::from_str_radix(ab.next().unwrap_or("0"), 16)
+                                .unwrap_or(0);
+                            let mut buf = vec![0u8; (e - s) as usize];
+                            p.mem.borrow().read_slice(s, &mut buf);
+                            let _ = std::fs::write(
+                                format!("{}-{}", path, p.pid),
+                                &buf,
+                            );
+                        }
+                    }
+                }
                 std::process::exit(124);
             }
             // Pick the next runnable process (round-robin).
@@ -363,7 +400,10 @@ impl Scheduler {
                     let core = p.sys.binder.borrow();
                     let has_work = core.has_inbox(p.tgid);
                     drop(core);
-                    let sig_ready = p.sys.pending & !p.sys.sig_mask != 0;
+                    let sig_ready = (p.sys.pending
+                        | p.sys.sighand.borrow().group_pending)
+                        & !p.sys.sig_mask
+                        != 0;
                     if !has_work && !sig_ready {
                         continue;
                     }
@@ -414,7 +454,19 @@ impl Scheduler {
             }
             match slice_end {
                 SliceEnd::Budget => {}
-                SliceEnd::Fork(parent_idx) => self.do_fork(parent_idx),
+                SliceEnd::Fork(parent_idx) => {
+                    self.do_fork(parent_idx);
+                    // Child runs first (as on Linux): a newborn
+                    // thread/process must consume its start-up
+                    // arguments before the parent can recycle
+                    // the memory they live in. GB Dalvik's
+                    // thread bootstrap info sits in a heap block
+                    // the parent's allocator trims within a few
+                    // thousand steps; round-robin latency made
+                    // the Signal Catcher read a zeroed function
+                    // pointer and jump to address 0.
+                    cursor = self.procs.len() - 1;
+                }
                 SliceEnd::Wait4(idx, pid, status_ptr, options) => {
                     self.do_wait(idx, pid, status_ptr, options);
                 }
@@ -453,6 +505,8 @@ impl Scheduler {
                 }
                 SliceEnd::Clone(idx, flags, stack, ptid, tls, ctid) => {
                     self.do_clone(idx, flags, stack, ptid, tls, ctid);
+                    // Child runs first: see the Fork arm.
+                    cursor = self.procs.len() - 1;
                 }
                 SliceEnd::SendSignal(idx, tgid, tid, sig) => {
                     self.do_send_signal(idx, tgid, tid, sig);
@@ -694,6 +748,7 @@ impl Scheduler {
                     *act = syscall::SigAction::default();
                 }
             }
+            sh.group_pending = 0;
         }
         self.procs[idx].sys.pending = 0;
         self.procs[idx].cleartid = 0;
@@ -775,7 +830,23 @@ impl Scheduler {
                     parent.mem.borrow().clone_sparse(),
                 ))
             };
+            let sighand = parent.sys.sighand.clone();
+            let asp = parent.sys.asp.clone();
             let mut sys = parent.sys.fork_clone(tid);
+            if flags & 0x400 != 0 {
+                // CLONE_SIGHAND: threads share dispositions (and
+                // the group pending word) with the group.
+                // fork_clone always builds a fresh table, which
+                // also silently un-shared handler updates.
+                sys.sighand = sighand;
+            }
+            if flags & CLONE_VM != 0 {
+                // CLONE_VM: the address space (brk + mmap
+                // bookkeeping) is one object for the whole
+                // group; fork_clone's snapshot copy diverges
+                // and corrupts the shared heap (see AddrSpace).
+                sys.asp = asp;
+            }
             sys.tgid = tgid;
             sys.ppid = ppid;
             Process {
@@ -842,13 +913,10 @@ impl Scheduler {
         if tid.is_some() {
             self.procs[ti].sys.pending |= bit;
         } else {
-            // Group signal: anchor on the leader if present.
-            let anchor = self
-                .procs
-                .iter()
-                .position(|p| p.pid == self.procs[ti].tgid)
-                .unwrap_or(ti);
-            self.procs[anchor].sys.pending |= bit;
+            // Group signal: park it on the group's shared
+            // pending word; any member thread may consume it
+            // (deliver_pending) or wait for it (rt_sigtimedwait).
+            self.procs[ti].sys.sighand.borrow_mut().group_pending |= bit;
         }
     }
 
@@ -871,12 +939,9 @@ impl Scheduler {
             .iter()
             .position(|p| p.pid == tgid)
             .unwrap_or(idx);
+        let _ = anchor;
         let mut pending = self.procs[idx].sys.pending;
-        if anchor != idx {
-            pending |= self.procs[anchor].sys.pending;
-        } else {
-            pending |= self.procs[idx].sys.pending;
-        }
+        pending |= self.procs[idx].sys.sighand.borrow().group_pending;
         let mask = self.procs[idx].sys.sig_mask;
         // SIGKILL(9) / SIGSTOP(19) ignore the mask entirely.
         let mut avail = pending & !mask;
@@ -895,7 +960,7 @@ impl Scheduler {
         if self.procs[idx].sys.pending & bit != 0 {
             self.procs[idx].sys.pending &= !bit;
         } else {
-            self.procs[anchor].sys.pending &= !bit;
+            self.procs[idx].sys.sighand.borrow_mut().group_pending &= !bit;
         }
         let action = self.procs[idx].sys.sighand.borrow().actions[sig as usize];
         match action.handler {

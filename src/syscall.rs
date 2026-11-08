@@ -28,12 +28,20 @@ pub struct SigAction {
 
 pub struct SigShared {
     pub actions: [SigAction; 65],
+    /// Group-directed pending signals (kill(2) to the tgid).
+    /// Lives here rather than on one member's `pending` so
+    /// any thread of the group can consume them -- GB
+    /// Dalvik's Signal Catcher thread waits in rt_sigtimedwait
+    /// for process-directed SIGQUIT/SIGUSR1 that the main
+    /// thread never touches.
+    pub group_pending: u64,
 }
 
 impl Default for SigShared {
     fn default() -> SigShared {
         SigShared {
             actions: std::array::from_fn(|_| SigAction::default()),
+            group_pending: 0,
         }
     }
 }
@@ -123,19 +131,31 @@ const ENOSYS: i32 = 38;
 const AT_FDCWD: i32 = -100;
 const MAP_BASE: u32 = 0x0200_0000;
 
+/// Address-space bookkeeping: the program break, the mmap
+/// bump pointer and the live mmap interval list (base, len),
+/// page aligned. GB binaries are prelinked: the linker
+/// demands exact load addresses via mmap hints, so hint-less
+/// bump allocation alone cannot serve it -- the intervals
+/// also decide whether a hinted address is free and what
+/// MAP_FIXED / munmap replace.
+///
+/// This state describes the shared memory, so CLONE_VM
+/// threads must share ONE instance. A per-thread copy
+/// diverges silently: one thread's stale brk value makes a
+/// later brk "grow" re-zero heap pages another thread is
+/// actively using (GB Dalvik lost its Signal Catcher's
+/// bootstrap block exactly this way).
+pub struct AddrSpace {
+    pub brk: u32,
+    pub mmap_next: u32,
+    pub maps: Vec<(u32, u32)>,
+}
+
 pub struct Syscalls {
     pub fs: GuestFs,
     pub log_unimplemented: bool,
     seen: std::collections::HashSet<u32>,
-    brk: u32,
-    mmap_next: u32,
-    /// Live mmap intervals (base, len), page aligned. GB
-    /// binaries are prelinked: the linker demands exact load
-    /// addresses via mmap hints, so hint-less bump allocation
-    /// alone cannot serve it -- the intervals also decide
-    /// whether a hinted address is free and what MAP_FIXED /
-    /// munmap replace.
-    maps: Vec<(u32, u32)>,
+    pub asp: std::rc::Rc<std::cell::RefCell<AddrSpace>>,
     rng: u64,
     /// This process's pid / parent pid (scheduler-assigned).
     pub pid: u32,
@@ -157,6 +177,10 @@ pub struct Syscalls {
     pub sig_mask: u64,
     /// This thread's own pending signals.
     pub pending: u64,
+    /// flock() state: guest path -> (holding fd, exclusive).
+    /// Per-process table; the dex-cache locker is the only
+    /// consumer so far and it locks its own fresh file.
+    pub flocks: std::collections::HashMap<String, (i32, bool)>,
     /// The in-core binder driver, shared by every task in the
     /// run (binder IPC crosses process boundaries by design).
     pub binder: std::rc::Rc<std::cell::RefCell<crate::binder::BinderCore>>,
@@ -221,9 +245,11 @@ impl Syscalls {
             fs: GuestFs::new(rootfs),
             log_unimplemented: true,
             seen: std::collections::HashSet::new(),
-            brk: (image_end + 0xFFF) & !0xFFF,
-            mmap_next: MAP_BASE,
-            maps: Vec::new(),
+            asp: std::rc::Rc::new(std::cell::RefCell::new(AddrSpace {
+                brk: (image_end + 0xFFF) & !0xFFF,
+                mmap_next: MAP_BASE,
+                maps: Vec::new(),
+            })),
             rng: seed | 1,
             pid: 100,
             ppid: 99,
@@ -232,6 +258,7 @@ impl Syscalls {
             sighand: std::rc::Rc::new(std::cell::RefCell::new(SigShared::default())),
             sig_mask: 0,
             pending: 0,
+            flocks: std::collections::HashMap::new(),
             binder: std::rc::Rc::new(std::cell::RefCell::new(crate::binder::BinderCore::new())),
             umask: 0o022,
             unix: std::rc::Rc::new(std::cell::RefCell::new(UnixCore {
@@ -246,15 +273,18 @@ impl Syscalls {
     /// deliberately survive (POSIX: open fds stay open across
     /// exec unless CLOEXEC, which we do not track yet).
     pub fn reset_exec(&mut self, image_end: u32) {
-        self.brk = (image_end + 0xFFF) & !0xFFF;
-        self.mmap_next = MAP_BASE;
-        self.maps.clear();
+        let mut asp = self.asp.borrow_mut();
+        asp.brk = (image_end + 0xFFF) & !0xFFF;
+        asp.mmap_next = MAP_BASE;
+        asp.maps.clear();
     }
 
     /// Is [base, base+len) disjoint from every live interval?
     fn range_free(&self, base: u32, len: u32) -> bool {
         let end = base.wrapping_add(len);
-        self.maps
+        self.asp
+            .borrow()
+            .maps
             .iter()
             .all(|&(b, l)| b.wrapping_add(l) <= base || b >= end)
     }
@@ -263,8 +293,9 @@ impl Syscalls {
     /// partial overlaps the way munmap/MAP_FIXED replacement do.
     fn unmap_range(&mut self, base: u32, len: u32) {
         let end = base.wrapping_add(len);
-        let mut out = Vec::with_capacity(self.maps.len());
-        for &(b, l) in &self.maps {
+        let mut asp = self.asp.borrow_mut();
+        let mut out = Vec::with_capacity(asp.maps.len());
+        for &(b, l) in &asp.maps {
             let e = b.wrapping_add(l);
             if e <= base || b >= end {
                 out.push((b, l));
@@ -277,7 +308,7 @@ impl Syscalls {
                 }
             }
         }
-        self.maps = out;
+        asp.maps = out;
     }
 
     /// Duplicate this syscall state for a fork child. Open files
@@ -343,9 +374,11 @@ impl Syscalls {
             },
             log_unimplemented: self.log_unimplemented,
             seen: self.seen.clone(),
-            brk: self.brk,
-            mmap_next: self.mmap_next,
-            maps: self.maps.clone(),
+            asp: std::rc::Rc::new(std::cell::RefCell::new(AddrSpace {
+                brk: self.asp.borrow().brk,
+                mmap_next: self.asp.borrow().mmap_next,
+                maps: self.asp.borrow().maps.clone(),
+            })),
             rng: self.rng,
             pid: child_pid,
             ppid: self.pid,
@@ -353,9 +386,11 @@ impl Syscalls {
             tid_addr: 0,
             sighand: std::rc::Rc::new(std::cell::RefCell::new(SigShared {
                 actions: self.sighand.borrow().actions,
+                group_pending: 0,
             })),
             sig_mask: self.sig_mask,
             pending: 0,
+            flocks: self.flocks.clone(),
             binder: self.binder.clone(),
             umask: self.umask,
             unix: self.unix.clone(),
@@ -601,6 +636,47 @@ impl Syscalls {
                     tid: None,
                     sig: a1,
                 };
+            }
+            177 => {
+                // rt_sigtimedwait(set, info, timeout, size):
+                // consume a pending signal from the wait set
+                // (this thread's own pending word, or the
+                // group's shared one). GB Dalvik's Signal
+                // Catcher thread lives here waiting for
+                // SIGQUIT/SIGUSR1; on ENOSYS it read an
+                // uninitialized signal number and "reacted" to
+                // garbage forever. Nothing pending parks the
+                // thread via the re-issue mechanism; a zero
+                // timeout polls and fails with EAGAIN.
+                if a3 != 8 {
+                    return done(cpu, err(EINVAL));
+                }
+                let set = mem.read_u32(a0) as u64
+                    | ((mem.read_u32(a0 + 4) as u64) << 32);
+                let avail = (self.pending
+                    | self.sighand.borrow().group_pending)
+                    & set;
+                if avail != 0 {
+                    let sig = avail.trailing_zeros() + 1;
+                    let bit = 1u64 << (sig - 1);
+                    if self.pending & bit != 0 {
+                        self.pending &= !bit;
+                    } else {
+                        self.sighand.borrow_mut().group_pending &= !bit;
+                    }
+                    if a1 != 0 {
+                        // siginfo_t: signo at +0, errno at +4,
+                        // code at +8 (SI_USER = -1 for kill()).
+                        mem.write_slice(a1, &[0u8; 32]);
+                        put32(mem, a1, sig);
+                        put32(mem, a1 + 8, (-1i32) as u32);
+                    }
+                    return done(cpu, sig);
+                }
+                if a2 != 0 && mem.read_u32(a2) == 0 && mem.read_u32(a2 + 4) == 0 {
+                    return done(cpu, err(EAGAIN));
+                }
+                return Outcome::WouldBlock;
             }
             130 => {
                 // tkill(tid, sig)
@@ -1083,6 +1159,17 @@ impl Syscalls {
                 self.umask = a0 & 0o777;
                 old
             }
+            172 => {
+                // prctl(option, ...): thread names (PR_SET_NAME
+                // =15 / PR_GET_NAME=16) are the only options GB
+                // userland exercises at this stage (bionic's
+                // pthread_setname_np via Dalvik thread init);
+                // accept everything, report an empty name.
+                if a0 == 16 && a1 != 0 {
+                    mem.write_slice(a1, &[0u8; 16]);
+                }
+                0
+            }
             41 => {
                 // dup(fd)
                 match self.clone_fd(a0 as i32) {
@@ -1091,17 +1178,20 @@ impl Syscalls {
                 }
             }
             45 => {
-                // brk(addr)
-                if a0 != 0 && a0 >= (self.brk & !0xFFF) && a0 < MAP_BASE {
-                    if a0 > self.brk {
-                        let (s, e) = (self.brk as usize, a0 as usize);
+                // brk(addr): the break lives in the shared
+                // AddrSpace; every thread of the group must
+                // observe (and move) the same value.
+                let mut asp = self.asp.borrow_mut();
+                if a0 != 0 && a0 >= (asp.brk & !0xFFF) && a0 < MAP_BASE {
+                    if a0 > asp.brk {
+                        let (s, e) = (asp.brk as usize, a0 as usize);
                         if e <= mem.len() {
                             mem.zero_range(s as u32, e - s);
                         }
                     }
-                    self.brk = a0;
+                    asp.brk = a0;
                 }
-                self.brk
+                asp.brk
             }
             54 => {
                 // ioctl(fd, request, arg)
@@ -1159,6 +1249,46 @@ impl Syscalls {
                         }
                     }
                     _ => err(ENOTTY),
+                }
+            }
+            143 => {
+                // flock(fd, op): LOCK_SH=1, LOCK_EX=2, LOCK_UN=8,
+                // LOCK_NB=4. Locks are keyed by the fd's guest
+                // path in a per-process table. GB libdvm locks
+                // the dex cache file before optimizing; ENOSYS
+                // here made every jar load fail with "Can't lock
+                // dex cache". Blocking requests are granted when
+                // free (the core is cooperatively scheduled, so
+                // no holder can release while we would wait);
+                // a contended NB request fails with EWOULDBLOCK.
+                let fd = a0 as i32;
+                let path = match self.fs.fds.get(&fd) {
+                    Some(f) => f.path.clone().unwrap_or_default(),
+                    None => return err(EBADF),
+                };
+                if path.is_empty() {
+                    return 0; // pipes/devices: nothing to lock
+                }
+                let op = a1;
+                if op & 8 != 0 {
+                    // LOCK_UN
+                    if matches!(self.flocks.get(&path), Some(&(h, _)) if h == fd) {
+                        self.flocks.remove(&path);
+                    }
+                    0
+                } else if op & 3 == 1 || op & 3 == 2 {
+                    let excl = op & 3 == 2;
+                    match self.flocks.get(&path) {
+                        Some(&(h, hex)) if h != fd && (excl || hex) => {
+                            err(EAGAIN) // EWOULDBLOCK == EAGAIN
+                        }
+                        _ => {
+                            self.flocks.insert(path, (fd, excl));
+                            0
+                        }
+                    }
+                } else {
+                    err(EINVAL)
                 }
             }
             55 | 221 => {
@@ -1667,22 +1797,29 @@ impl Syscalls {
                 } else if want != 0 && self.range_free(want, len) {
                     want
                 } else {
-                    let mut b = self.mmap_next;
+                    let mut b = self.asp.borrow().mmap_next;
                     while !self.range_free(b, len) {
-                        match self.maps.iter().find(|&&(mb, ml)| {
-                            let me = mb.wrapping_add(ml);
-                            me > b && mb < b.wrapping_add(len)
-                        }) {
-                            Some(&(mb, ml)) => {
+                        match self
+                            .asp
+                            .borrow()
+                            .maps
+                            .iter()
+                            .find(|&&(mb, ml)| {
+                                let me = mb.wrapping_add(ml);
+                                me > b && mb < b.wrapping_add(len)
+                            })
+                            .copied()
+                        {
+                            Some((mb, ml)) => {
                                 b = (mb.wrapping_add(ml) + 0xFFF) & !0xFFF;
                             }
                             None => break,
                         }
                     }
-                    self.mmap_next = b.wrapping_add(len);
+                    self.asp.borrow_mut().mmap_next = b.wrapping_add(len);
                     b
                 };
-                self.maps.push((base, len));
+                self.asp.borrow_mut().maps.push((base, len));
                 mem.zero_range(base, len as usize);
                 let anon = a3 & 0x20 != 0 || a4 as i32 == -1;
                 if a3 & 0x01 != 0 {
