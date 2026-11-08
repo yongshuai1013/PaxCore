@@ -23,6 +23,46 @@ pub enum FdKind {
     /// /dev/binder: serviced entirely by the in-core binder
     /// driver (crate::binder) through the ioctl path.
     Binder,
+    /// A character device registered by mknod. Behaviour is
+    /// chosen by (major, minor) in Fd::read / Fd::write:
+    /// (1,3) null, (1,5) zero, (5,1)/(5,0) console/tty,
+    /// everything else an inert sink/source.
+    CharDev { major: u32, minor: u32 },
+    /// A connected AF_UNIX stream endpoint. rx drains what the
+    /// peer wrote; tx carries this end's writes (the two
+    /// PipeShared queues of the pair cross over).
+    UnixStream { rx: PipeEnd, tx: PipeEnd },
+    /// An AF_UNIX socket after socket() but before bind().
+    UnixSocket,
+    /// An AF_UNIX socket bound to a filesystem path. The
+    /// pending queue is shared with the core-wide registry
+    /// (crate::syscall::UnixCore) that connect() looks up.
+    UnixListener {
+        path: String,
+        pending: std::rc::Rc<
+            std::cell::RefCell<std::collections::VecDeque<(PipeEnd, PipeEnd)>>,
+        >,
+    },
+}
+
+/// Build the two ends of a connected AF_UNIX stream pair.
+/// PipeEnd::new_pair gives (read_end, write_end) over ONE
+/// shared queue, so a stream pair needs two queues: endpoint
+/// A reads queue 2 and writes queue 1, B is the mirror. The
+/// queues' live-end counts give EOF (peer closed its write
+/// end) and EPIPE (peer closed its read end) for free.
+pub fn unix_stream_pair() -> (FdKind, FdKind) {
+    let (q1_read, q1_write) = PipeEnd::new_pair();
+    let (q2_read, q2_write) = PipeEnd::new_pair();
+    let end_a = FdKind::UnixStream {
+        rx: q2_read,
+        tx: q1_write,
+    };
+    let end_b = FdKind::UnixStream {
+        rx: q1_read,
+        tx: q2_write,
+    };
+    (end_a, end_b)
 }
 
 /// Shared pipe buffer with live-end counts. Counts are kept by
@@ -99,6 +139,13 @@ pub struct Fd {
     pub dir_pos: usize,
     /// Snapshot of directory entries, taken on first getdents64.
     pub dir_entries: Option<Vec<(String, u64, u8)>>,
+    /// File status flags from open()/fcntl(F_SETFL); bit
+    /// O_NONBLOCK (0x800) is the one the syscall layer acts on
+    /// (EAGAIN instead of parking).
+    pub status_flags: u32,
+    /// FD_CLOEXEC, from fcntl(F_SETFD). Recorded, not acted on
+    /// (exec does not close fds yet).
+    pub cloexec: bool,
 }
 
 impl Fd {
@@ -107,7 +154,12 @@ impl Fd {
             kind,
             dir_pos: 0,
             dir_entries: None,
+            status_flags: 0,
+            cloexec: false,
         }
+    }
+    pub fn nonblock(&self) -> bool {
+        self.status_flags & 0x800 != 0
     }
 }
 
@@ -116,6 +168,11 @@ pub struct GuestFs {
     /// Guest-visible cwd, normalized absolute ("/" or "/a/b").
     pub cwd: String,
     pub fds: HashMap<i32, Fd>,
+    /// Device nodes created by mknod: guest absolute path ->
+    /// (mode, dev) exactly as the guest passed them. There is
+    /// no host node behind these; open() consults this table
+    /// before the host tree.
+    pub devices: HashMap<String, (u32, u32)>,
 }
 
 impl GuestFs {
@@ -128,6 +185,7 @@ impl GuestFs {
             root: PathBuf::from(root),
             cwd: "/".to_string(),
             fds,
+            devices: HashMap::new(),
         }
     }
 
@@ -246,6 +304,20 @@ fn file_type_bits(md: &std::fs::Metadata) -> u32 {
 impl Fd {
     pub fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         match &mut self.kind {
+            FdKind::CharDev { major: 1, minor: 5 } => {
+                // /dev/zero: endless zeroes.
+                out.fill(0);
+                Ok(out.len())
+            }
+            FdKind::CharDev { .. } => Ok(0), // null & co: EOF
+            FdKind::UnixStream { rx, .. } => {
+                let mut q = rx.shared.q.lock().unwrap();
+                let n = q.len().min(out.len());
+                for slot in out.iter_mut().take(n) {
+                    *slot = q.pop_front().unwrap();
+                }
+                Ok(n)
+            }
             FdKind::File(f) => f.read(out),
             FdKind::StdIn => Ok(0), // EOF (host stdin not wired in M1)
             FdKind::Pipe(end) if !end.write => {
@@ -263,6 +335,27 @@ impl Fd {
     }
     pub fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         match &mut self.kind {
+            FdKind::CharDev { major: 5, minor: 0 | 1 } => {
+                // /dev/tty, /dev/console: the host's stdout.
+                std::io::stdout().write(data)
+            }
+            FdKind::CharDev { major: 1, minor: 11 } => {
+                // /dev/kmsg: the guest kernel log -- mirror it
+                // to the host's stderr so init's own diagnostics
+                // stay visible while debugging the boot.
+                std::io::stderr().write(data)
+            }
+            FdKind::CharDev { .. } => Ok(data.len()), // sink
+            FdKind::UnixStream { tx, .. } => {
+                if tx.readers() == 0 {
+                    return Err(std::io::Error::from_raw_os_error(32)); // EPIPE
+                }
+                let mut q = tx.shared.q.lock().unwrap();
+                let room = 65_536usize.saturating_sub(q.len());
+                let n = room.min(data.len());
+                q.extend(data[..n].iter().copied());
+                Ok(n)
+            }
             FdKind::File(f) => f.write(data),
             FdKind::StdOut => std::io::stdout().write(data),
             FdKind::StdErr => std::io::stderr().write(data),

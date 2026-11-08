@@ -38,6 +38,25 @@ impl Default for SigShared {
     }
 }
 
+/// Core-wide AF_UNIX listener registry: bound filesystem path
+/// -> the pending-connection queue that the listener's accept()
+/// drains and connect() pushes into. Shared by every task in
+/// the run (like the binder core), because init binds sockets
+/// that unrelated processes connect to.
+pub struct UnixCore {
+    pub listeners: std::collections::HashMap<
+        String,
+        std::rc::Rc<
+            std::cell::RefCell<
+                std::collections::VecDeque<(
+                    crate::fs::PipeEnd,
+                    crate::fs::PipeEnd,
+                )>,
+            >,
+        >,
+    >,
+}
+
 pub enum Outcome {
     Continue,
     /// kill/tkill/tgkill: the scheduler owns the process table
@@ -91,6 +110,7 @@ pub enum Outcome {
 const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
 const EBADF: i32 = 9;
+const EAGAIN: i32 = 11;
 const EFAULT: i32 = 14;
 const EEXIST: i32 = 17;
 const ENOTDIR: i32 = 20;
@@ -140,6 +160,12 @@ pub struct Syscalls {
     /// The in-core binder driver, shared by every task in the
     /// run (binder IPC crosses process boundaries by design).
     pub binder: std::rc::Rc<std::cell::RefCell<crate::binder::BinderCore>>,
+    /// File creation mask (umask syscall); consulted by the
+    /// host-backed file creation paths only loosely -- the
+    /// guest-visible value is what init reads back.
+    pub umask: u32,
+    /// The core-wide AF_UNIX listener registry.
+    pub unix: std::rc::Rc<std::cell::RefCell<UnixCore>>,
 }
 
 fn err(code: i32) -> u32 {
@@ -196,6 +222,10 @@ impl Syscalls {
             sig_mask: 0,
             pending: 0,
             binder: std::rc::Rc::new(std::cell::RefCell::new(crate::binder::BinderCore::new())),
+            umask: 0o022,
+            unix: std::rc::Rc::new(std::cell::RefCell::new(UnixCore {
+                listeners: std::collections::HashMap::new(),
+            })),
         }
     }
 
@@ -259,6 +289,21 @@ impl Syscalls {
                 crate::fs::FdKind::Dir(p) => crate::fs::FdKind::Dir(p.clone()),
                 crate::fs::FdKind::Pipe(e) => crate::fs::FdKind::Pipe(e.clone()),
                 crate::fs::FdKind::Binder => crate::fs::FdKind::Binder,
+                crate::fs::FdKind::CharDev { major, minor } => crate::fs::FdKind::CharDev {
+                    major: *major,
+                    minor: *minor,
+                },
+                crate::fs::FdKind::UnixStream { rx, tx } => crate::fs::FdKind::UnixStream {
+                    rx: rx.clone(),
+                    tx: tx.clone(),
+                },
+                crate::fs::FdKind::UnixSocket => crate::fs::FdKind::UnixSocket,
+                crate::fs::FdKind::UnixListener { path, pending } => {
+                    crate::fs::FdKind::UnixListener {
+                        path: path.clone(),
+                        pending: pending.clone(),
+                    }
+                }
             };
             fds.insert(
                 *num,
@@ -266,6 +311,8 @@ impl Syscalls {
                     kind,
                     dir_pos: fd.dir_pos,
                     dir_entries: fd.dir_entries.clone(),
+                    status_flags: fd.status_flags,
+                    cloexec: fd.cloexec,
                 },
             );
         }
@@ -275,6 +322,7 @@ impl Syscalls {
                 root: self.fs.root.clone(),
                 cwd: self.fs.cwd.clone(),
                 fds,
+                devices: self.fs.devices.clone(),
             },
             log_unimplemented: self.log_unimplemented,
             seen: self.seen.clone(),
@@ -292,6 +340,8 @@ impl Syscalls {
             sig_mask: self.sig_mask,
             pending: 0,
             binder: self.binder.clone(),
+            umask: self.umask,
+            unix: self.unix.clone(),
         }
     }
 
@@ -305,6 +355,18 @@ impl Syscalls {
     }
 
     fn do_open(&mut self, base: Option<String>, path: &str, flags: u32) -> u32 {
+        let ret = self.do_open_inner(base, path, flags);
+        // O_NONBLOCK given at open time becomes the fd's
+        // initial status flag (fcntl can change it later).
+        if flags & 0x800 != 0 && (ret as i32) >= 0 {
+            if let Some(f) = self.fs.fds.get_mut(&(ret as i32)) {
+                f.status_flags |= 0x800;
+            }
+        }
+        ret
+    }
+
+    fn do_open_inner(&mut self, base: Option<String>, path: &str, flags: u32) -> u32 {
         let guest_abs = match &base {
             Some(b) => self.fs.resolve_from(b, path),
             None => self.fs.resolve(path),
@@ -319,6 +381,15 @@ impl Syscalls {
                 let fd = Fd::new(FdKind::File(f));
                 return self.fs.alloc_fd(fd) as u32;
             }
+        }
+        // Nodes registered by mknod (GB dev_t encoding:
+        // major = dev >> 8, minor = dev & 0xff).
+        if let Some(&(_mode, dev)) = self.fs.devices.get(&guest_abs) {
+            let fd = Fd::new(FdKind::CharDev {
+                major: dev >> 8,
+                minor: dev & 0xFF,
+            });
+            return self.fs.alloc_fd(fd) as u32;
         }
         let host = self.fs.host_path(&guest_abs);
         let md = std::fs::metadata(&host);
@@ -425,7 +496,9 @@ impl Syscalls {
                 cpu.r[15], cpu.r[14], self.tgid
             );
         }
-        if std::env::var_os("PAXCORE_TRACE").is_some() {
+        if std::env::var_os("PAXCORE_TRACE").is_some()
+            || std::env::var_os("PAXCORE_SYSCALLS").is_some()
+        {
             let path_note = match nr {
                 5 | 10 | 12 | 33 | 39 | 85 | 195 | 196 => {
                     format!(" path={:?}", read_guest_str(mem, cpu.r[0]))
@@ -544,9 +617,23 @@ impl Syscalls {
                     if let crate::fs::FdKind::Pipe(end) = &fd.kind {
                         if !end.write && end.queued() == 0 {
                             if end.writers() > 0 {
+                                if fd.nonblock() {
+                                    return done(cpu, err(EAGAIN));
+                                }
                                 return Outcome::WouldBlock;
                             }
                             return done(cpu, 0);
+                        }
+                    }
+                    if let crate::fs::FdKind::UnixStream { rx, .. } = &fd.kind {
+                        if rx.queued() == 0 {
+                            if rx.writers() > 0 {
+                                if fd.nonblock() {
+                                    return done(cpu, err(EAGAIN));
+                                }
+                                return Outcome::WouldBlock;
+                            }
+                            return done(cpu, 0); // peer closed: EOF
                         }
                     }
                 }
@@ -576,6 +663,17 @@ impl Syscalls {
                 if let Some(fd) = self.fs.fds.get(&(a0 as i32)) {
                     if let crate::fs::FdKind::Pipe(end) = &fd.kind {
                         if end.write && end.queued() >= 65_536 && end.readers() > 0 {
+                            if fd.nonblock() {
+                                return done(cpu, err(EAGAIN));
+                            }
+                            return Outcome::WouldBlock;
+                        }
+                    }
+                    if let crate::fs::FdKind::UnixStream { tx, .. } = &fd.kind {
+                        if tx.queued() >= 65_536 && tx.readers() > 0 {
+                            if fd.nonblock() {
+                                return done(cpu, err(EAGAIN));
+                            }
                             return Outcome::WouldBlock;
                         }
                     }
@@ -592,6 +690,132 @@ impl Syscalls {
                     },
                     None => err(EBADF),
                 }
+            }
+            281 => {
+                // socket(domain, type, protocol): AF_UNIX stream
+                // only for now (init's property/control sockets;
+                // other domains fail with EAFNOSUPPORT).
+                if a0 == 1 && a1 & 0xF == 1 {
+                    let fd = Fd::new(FdKind::UnixSocket);
+                    self.fs.alloc_fd(fd) as u32
+                } else {
+                    err(97) // EAFNOSUPPORT
+                }
+            }
+            282 => {
+                // bind(fd, sockaddr_un, addrlen)
+                let path = match read_sockaddr_un(mem, a1, a2) {
+                    Some(p) => self.fs.resolve(&p),
+                    None => return done(cpu, err(EINVAL)),
+                };
+                match self.fs.fds.get(&(a0 as i32)) {
+                    Some(f) if matches!(f.kind, FdKind::UnixSocket) => {}
+                    Some(_) => return done(cpu, err(EINVAL)),
+                    None => return done(cpu, err(EBADF)),
+                }
+                let pending = std::rc::Rc::new(std::cell::RefCell::new(
+                    std::collections::VecDeque::new(),
+                ));
+                {
+                    let mut core = self.unix.borrow_mut();
+                    if core.listeners.contains_key(&path) {
+                        return done(cpu, err(98)); // EADDRINUSE
+                    }
+                    core.listeners.insert(path.clone(), pending.clone());
+                }
+                // A placeholder in the host tree so path-based
+                // ops (chmod/stat) see the socket like a real
+                // bound /dev/socket/* node.
+                let host = self.fs.host_path(&path);
+                if let Some(parent) = host.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::File::create(&host);
+                if let Some(f) = self.fs.fds.get_mut(&(a0 as i32)) {
+                    f.kind = FdKind::UnixListener { path, pending };
+                }
+                0
+            }
+            284 => {
+                // listen(fd, backlog): bind() already produced
+                // the listener state; just validate.
+                match self.fs.fds.get(&(a0 as i32)) {
+                    Some(f) if matches!(f.kind, FdKind::UnixListener { .. }) => 0,
+                    Some(_) => err(EINVAL),
+                    None => err(EBADF),
+                }
+            }
+            285 => {
+                // accept(fd, ...): pop a pending connection, or
+                // park until one arrives (pipe-style WouldBlock).
+                let pending = match self.fs.fds.get(&(a0 as i32)) {
+                    Some(f) => match &f.kind {
+                        FdKind::UnixListener { pending, .. } => {
+                            std::rc::Rc::clone(pending)
+                        }
+                        _ => return done(cpu, err(EINVAL)),
+                    },
+                    None => return done(cpu, err(EBADF)),
+                };
+                let popped = pending.borrow_mut().pop_front();
+                match popped {
+                    Some((rx, tx)) => {
+                        let fd = Fd::new(FdKind::UnixStream { rx, tx });
+                        self.fs.alloc_fd(fd) as u32
+                    }
+                    None => {
+                        if self
+                            .fs
+                            .fds
+                            .get(&(a0 as i32))
+                            .map(|f| f.nonblock())
+                            .unwrap_or(false)
+                        {
+                            err(EAGAIN)
+                        } else {
+                            return Outcome::WouldBlock;
+                        }
+                    }
+                }
+            }
+            283 => {
+                // connect(fd, sockaddr_un, addrlen)
+                let path = match read_sockaddr_un(mem, a1, a2) {
+                    Some(p) => self.fs.resolve(&p),
+                    None => return done(cpu, err(EINVAL)),
+                };
+                let pending = {
+                    let core = self.unix.borrow();
+                    match core.listeners.get(&path) {
+                        Some(q) => q.clone(),
+                        None => return done(cpu, err(111)), // ECONNREFUSED
+                    }
+                };
+                let (client, server) = crate::fs::unix_stream_pair();
+                let (rx, tx) = match server {
+                    FdKind::UnixStream { rx, tx } => (rx, tx),
+                    _ => unreachable!(),
+                };
+                pending.borrow_mut().push_back((rx, tx));
+                match self.fs.fds.get_mut(&(a0 as i32)) {
+                    Some(f) if matches!(f.kind, FdKind::UnixSocket) => {
+                        f.kind = client;
+                        0
+                    }
+                    _ => err(EBADF),
+                }
+            }
+            288 => {
+                // socketpair(domain, type, protocol, sv[2])
+                if a0 != 1 || a1 & 0xF != 1 || a3 == 0 {
+                    return done(cpu, err(EINVAL));
+                }
+                let (end_a, end_b) = crate::fs::unix_stream_pair();
+                let fd_a = self.fs.alloc_fd(Fd::new(end_a));
+                let fd_b = self.fs.alloc_fd(Fd::new(end_b));
+                put32(mem, a3, fd_a as u32);
+                put32(mem, a3 + 4, fd_b as u32);
+                0
             }
             5 => {
                 let p = read_guest_str(mem, a0);
@@ -661,7 +885,9 @@ impl Syscalls {
             _ => self.handle2(cpu, mem, nr),
         };
         cpu.r[0] = ret;
-        if std::env::var_os("PAXCORE_TRACE").is_some() {
+        if std::env::var_os("PAXCORE_TRACE").is_some()
+            || std::env::var_os("PAXCORE_SYSCALLS").is_some()
+        {
             eprintln!("[syscall] nr={nr} -> 0x{ret:08x}");
         }
         Outcome::Continue
@@ -675,6 +901,30 @@ fn done(cpu: &mut Cpu, v: u32) -> Outcome {
 
 /// Kernel sigaction (ARM) serialization: handler, flags,
 /// restorer, mask as two u32s -- 20 bytes at `addr`.
+/// Parse a sockaddr_un from guest memory: family u16 at +0
+/// (must be AF_UNIX=1), NUL-terminated path at +2 bounded by
+/// addrlen. Returns the guest path, or None for abstract
+/// sockets and malformed addresses (unsupported here).
+fn read_sockaddr_un(mem: &Mem, addr: u32, addrlen: u32) -> Option<String> {
+    let a = addr as usize;
+    if a + 2 > mem.len() || mem.read_u16(addr) != 1 {
+        return None;
+    }
+    let max = (addrlen as usize).min(108);
+    let mut bytes = Vec::new();
+    for i in 0..max {
+        let b = mem.byte((a + 2 + i) as u32);
+        if b == 0 {
+            break;
+        }
+        bytes.push(b);
+    }
+    if bytes.is_empty() {
+        return None; // abstract-namespace socket: unsupported
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn read_sigaction(mem: &Mem, addr: u32) -> SigAction {
     let a = addr as usize;
     let w = |o: usize| mem.read_u32((a + o) as u32);
@@ -742,6 +992,42 @@ impl Syscalls {
                     Ok(()) => 0,
                     Err(e) => io_err(&e),
                 }
+            }
+            14 => {
+                // mknod(path, mode, dev): character/block nodes
+                // go into the fs device registry (open serves
+                // them from the core); anything else becomes an
+                // empty host file, like a real mknod of a
+                // regular file.
+                let p = read_guest_str(mem, a0);
+                let abs = self.fs.resolve(&p);
+                if self.fs.devices.contains_key(&abs) {
+                    err(EEXIST)
+                } else if a1 & 0o170000 == 0o020000 || a1 & 0o170000 == 0o060000 {
+                    self.fs.devices.insert(abs, (a1, a2));
+                    0
+                } else {
+                    let host = self.fs.host_path(&abs);
+                    match std::fs::File::create_new(&host) {
+                        Ok(_) => 0,
+                        Err(e) => io_err(&e),
+                    }
+                }
+            }
+            21 => {
+                // mount(source, target, fstype, flags, data):
+                // the guest fs is a single host-backed tree, so
+                // mounts are accepted and recorded nowhere --
+                // the target directories already serve. (GB
+                // init mounts tmpfs/devpts/proc/sysfs here and
+                // only needs the calls to not fail.)
+                0
+            }
+            60 => {
+                // umask(new): returns the previous mask.
+                let old = self.umask;
+                self.umask = a0 & 0o777;
+                old
             }
             41 => {
                 // dup(fd)
@@ -811,8 +1097,30 @@ impl Syscalls {
                             None => err(EBADF),
                         }
                     }
-                    1 | 3 => 0, // F_GETFD / F_GETFL
-                    2 | 4 => 0, // F_SETFD / F_SETFL
+                    1 => {
+                        // F_GETFD
+                        self.fs.fds[&(a0 as i32)].cloexec as u32
+                    }
+                    2 => {
+                        // F_SETFD
+                        if let Some(f) = self.fs.fds.get_mut(&(a0 as i32)) {
+                            f.cloexec = a2 & 1 != 0;
+                        }
+                        0
+                    }
+                    3 => {
+                        // F_GETFL
+                        self.fs.fds[&(a0 as i32)].status_flags
+                    }
+                    4 => {
+                        // F_SETFL: O_NONBLOCK lives here; GB
+                        // init's signal drain depends on it
+                        // (a blocking read would park forever).
+                        if let Some(f) = self.fs.fds.get_mut(&(a0 as i32)) {
+                            f.status_flags = a2;
+                        }
+                        0
+                    }
                     _ => 0,
                 }
             }
@@ -925,12 +1233,28 @@ impl Syscalls {
             FdKind::Dir(p) => FdKind::Dir(p.clone()),
             FdKind::Pipe(e) => FdKind::Pipe(e.clone()),
             FdKind::Binder => FdKind::Binder,
+            FdKind::CharDev { major, minor } => FdKind::CharDev {
+                major: *major,
+                minor: *minor,
+            },
+            FdKind::UnixStream { rx, tx } => FdKind::UnixStream {
+                rx: rx.clone(),
+                tx: tx.clone(),
+            },
+            FdKind::UnixSocket => FdKind::UnixSocket,
+            FdKind::UnixListener { path, pending } => FdKind::UnixListener {
+                path: path.clone(),
+                pending: pending.clone(),
+            },
             FdKind::File(f) => match f.try_clone() {
                 Ok(c) => FdKind::File(c),
                 Err(_) => return None,
             },
         };
-        Some(Fd::new(kind))
+        let mut out = Fd::new(kind);
+        out.status_flags = src.status_flags;
+        out.cloexec = src.cloexec;
+        Some(out)
     }
 }
 
@@ -1069,19 +1393,73 @@ impl Syscalls {
             }
             162 => 0, // nanosleep: no wall-clock delay in M1
             168 => {
-                // poll(fds, nfds, timeout): everything is ready
+                // poll(fds, nfds, timeout): honest per-kind
+                // readiness (the old "everything is ready" lie
+                // made init's event loop spin on empty sockets).
+                // The timeout is not honoured; callers re-check
+                // conditions, and WouldBlock parks real waits.
                 let base = a0 as usize;
                 let nfds = a1 as usize;
                 if base + nfds * 8 > mem.len() {
                     return err(EFAULT);
                 }
+                let mut ready = 0u32;
                 for i in 0..nfds {
-                    let ev_off = base + i * 8 + 6;
-                    let ev = mem.read_u16((ev_off - 2) as u32);
-                    mem.set_byte(ev_off as u32, (ev & 0x5) as u8); // POLLIN|POLLOUT subset
-                    mem.set_byte((ev_off + 1) as u32, 0);
+                    let ent = base + i * 8;
+                    let fdno = mem.read_u32(ent as u32) as i32;
+                    let events = mem.read_u16((ent + 4) as u32);
+                    let mut rev: u16 = 0;
+                    match self.fs.fds.get(&fdno).map(|f| &f.kind) {
+                        None => rev = 0x20, // POLLNVAL
+                        Some(FdKind::StdIn) => rev = 0x1,
+                        Some(FdKind::StdOut) | Some(FdKind::StdErr) => rev = 0x4,
+                        Some(FdKind::File(_)) | Some(FdKind::Dir(_)) => rev = 0x5,
+                        Some(FdKind::CharDev { .. }) => rev = 0x5,
+                        Some(FdKind::Binder) => {
+                            if self.binder.borrow().has_inbox(self.tgid) {
+                                rev = 0x1;
+                            }
+                        }
+                        Some(FdKind::Pipe(end)) => {
+                            if end.write {
+                                if end.readers() == 0 {
+                                    rev = 0x8; // POLLERR
+                                } else if end.queued() < 65_536 {
+                                    rev = 0x4;
+                                }
+                            } else if end.queued() > 0 {
+                                rev = 0x1;
+                            } else if end.writers() == 0 {
+                                rev = 0x11; // POLLIN|POLLHUP (EOF)
+                            }
+                        }
+                        Some(FdKind::UnixStream { rx, tx }) => {
+                            if rx.queued() > 0 {
+                                rev |= 0x1;
+                            }
+                            if rx.writers() == 0 {
+                                rev |= 0x11; // readable EOF + HUP
+                            }
+                            if tx.readers() == 0 {
+                                rev |= 0x8;
+                            } else if tx.queued() < 65_536 {
+                                rev |= 0x4;
+                            }
+                        }
+                        Some(FdKind::UnixListener { pending, .. }) => {
+                            if !pending.borrow().is_empty() {
+                                rev = 0x1;
+                            }
+                        }
+                        Some(FdKind::UnixSocket) => {}
+                    }
+                    rev &= events | 0x18; // events mask + ERR/HUP always
+                    mem.write_u16((ent + 6) as u32, rev);
+                    if rev != 0 {
+                        ready += 1;
+                    }
                 }
-                nfds as u32
+                ready
             }
             174 => {
                 // rt_sigaction(sig, act, oldact, size): kernel
@@ -1251,25 +1629,68 @@ impl Syscalls {
             197 => self.do_stat(mem, Some(a0 as i32), "", a1, true),
             217 => self.do_getdents(mem, a0 as i32, a1, a2),
             67 => {
-                // readlink(path, buf, bufsiz)
-                let p = read_guest_str(mem, a0);
-                let target = if p == "/proc/self/exe" || p == "/proc/thread-self/exe" {
-                    Some(self.exe_path.clone())
+                // sigaction (legacy, non-RT): ARM nr 67 is the
+                // old sigaction syscall -- an earlier arm here
+                // mislabeled it readlink (that's nr 85, handled
+                // above) and fed init EINVAL for its SIGCHLD
+                // install. Legacy kernel layout: handler@0,
+                // mask@4 (one word), flags@8, restorer@12.
+                let sig = a0 as usize;
+                if sig == 0 || sig > 64 {
+                    err(EINVAL)
+                } else if a1 != 0 && (sig == 9 || sig == 19) {
+                    err(EINVAL)
                 } else {
-                    let host = self.fs.host_path(&p);
-                    std::fs::read_link(&host)
-                        .ok()
-                        .map(|t| t.to_string_lossy().into_owned())
-                };
-                match target {
-                    Some(t) => {
-                        let n = t.len().min(a2 as usize);
-                        put(mem, a1, &t.as_bytes()[..n]);
-                        n as u32
+                    if a2 != 0 {
+                        let old = self.sighand.borrow().actions[sig];
+                        put32(mem, a2, old.handler);
+                        put32(mem, a2 + 4, old.mask as u32);
+                        put32(mem, a2 + 8, old.flags);
+                        put32(mem, a2 + 12, old.restorer);
                     }
-                    None => err(22), // EINVAL: not a symlink
+                    if a1 != 0 {
+                        let act = SigAction {
+                            handler: mem.read_u32(a1),
+                            mask: mem.read_u32(a1 + 4) as u64,
+                            flags: mem.read_u32(a1 + 8),
+                            restorer: mem.read_u32(a1 + 12),
+                        };
+                        self.sighand.borrow_mut().actions[sig] = act;
+                    }
+                    0
                 }
             }
+            15 => {
+                // chmod(path, mode)
+                let p = read_guest_str(mem, a0);
+                let abs = self.fs.resolve(&p);
+                if self.fs.devices.contains_key(&abs) {
+                    0 // device node: no host file to chmod
+                } else {
+                    let host = self.fs.host_path(&abs);
+                    match std::fs::set_permissions(
+                        &host,
+                        std::os::unix::fs::PermissionsExt::from_mode(a1 & 0o7777),
+                    ) {
+                        Ok(()) => 0,
+                        Err(e) => io_err(&e),
+                    }
+                }
+            }
+            79 => 0, // settimeofday: accepted (guest clock is the host's)
+            83 => {
+                // symlink(target, linkpath)
+                let target = read_guest_str(mem, a0);
+                let link = read_guest_str(mem, a1);
+                let host = self.fs.host_path(&self.fs.resolve(&link));
+                match std::os::unix::fs::symlink(&target, &host) {
+                    Ok(()) => 0,
+                    Err(e) => io_err(&e),
+                }
+            }
+            212 => 0, // chown32: stat reports fixed guest ids anyway
+            57 => 0,  // setpgid: process groups are not modeled (yet)
+            75 => 0,  // setrlimit: limits are not enforced
             263 => {
                 // clock_gettime(clk, ts*)
                 let (secs, nanos) = now_unix();
