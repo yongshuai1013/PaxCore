@@ -1292,13 +1292,21 @@ impl Cpu {
                 self.r[REG_PC] = next_pc;
                 return true;
             }
-            // Three-register arithmetic.
-            if matches!(op, 0x2 | 0x3 | 0x8) && (word >> 4) & 1 == 0 {
-                let sub = op == 0x3 && (word >> 6) & 1 == 1;
+            // Three-register arithmetic. The destination
+            // register's packed number bleeds into op bit 22
+            // (s_idx puts an odd S register's low bit there):
+            // vmul.f32 s15, ... reads op == 0x6, not 0x2 -- the
+            // same bleed the VCVT-to-int gate above documents
+            // for 0xB/0xF. Canonical opcodes for this family
+            // (VMUL 0010, VADD/VSUB 0011, VDIV 1000) never set
+            // bit 22, so mask it out before matching.
+            let op3 = op & !0x4;
+            if matches!(op3, 0x2 | 0x3 | 0x8) && (word >> 4) & 1 == 0 {
+                let sub = op3 == 0x3 && (word >> 6) & 1 == 1;
                 if dbl {
                     let (d, n, m) = (d_idx(word), n_idx_d(word), m_idx_d(word));
                     let (a, b) = (self.get_d(n), self.get_d(m));
-                    let r = match op {
+                    let r = match op3 {
                         0x3 => {
                             if sub { a - b } else { a + b }
                         }
@@ -1309,7 +1317,7 @@ impl Cpu {
                 } else {
                     let (d, n, m) = (s_idx(word), n_idx_s(word), m_idx_s(word));
                     let (a, b) = (self.get_s(n), self.get_s(m));
-                    let r = match op {
+                    let r = match op3 {
                         0x3 => {
                             if sub { a - b } else { a + b }
                         }
@@ -1431,14 +1439,24 @@ impl Cpu {
             (1, 3) => {
                 if dbl { self.set_d(d, self.get_d(m_d).sqrt()); } else { self.set_s(s, self.get_s(m_s).sqrt()); }
             }
-            (4, 1) | (4, 3) => {
-                // VCMP: sets NZCV in FPSCR and the core flag copy.
+            (4, 1) | (4, 3) | (5, 1) | (5, 3) => {
+                // VCMP / VCMPE: sets NZCV in FPSCR. Bits 19-16
+                // (hi) select the second operand: 0100 = the Sm
+                // register, 0101 = +0.0. Bit 7 is only the E
+                // flag (NaN exception signaling); reading it as
+                // the zero selector made every VCMPE against a
+                // register compare against 0.0 instead --
+                // vcmpe.f32 (0.8, 1.0) reported GT, which in
+                // turn inverted Dalvik's cmpg/cmpl-float
+                // verdicts (a Java range check on 0.8f threw
+                // IllegalArgumentException while printing the
+                // perfectly intact value 8.0E-1).
                 let (a, b) = if dbl {
-                    (self.get_d(d), if (word >> 7) & 1 == 1 { 0.0 } else { self.get_d(m_d) })
+                    (self.get_d(d), if hi == 5 { 0.0 } else { self.get_d(m_d) })
                 } else {
                     (
                         self.get_s(s) as f64,
-                        if (word >> 7) & 1 == 1 { 0.0 } else { self.get_s(m_s) as f64 },
+                        if hi == 5 { 0.0 } else { self.get_s(m_s) as f64 },
                     )
                 };
                 let unordered = a.is_nan() || b.is_nan();

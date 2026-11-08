@@ -1010,6 +1010,12 @@ impl Syscalls {
             49 | 201 => 1000,   // geteuid / geteuid32
             50 | 202 => 1000,   // getegid / getegid32
             213 | 214 => 0,     // setuid32 / setgid32: pretend success
+            // setreuid32 / setregid32 / setresuid32 / setresgid32
+            // (numbers from the NDK unistd-eabi.h): zygote drops
+            // privileges with these before preloading classes;
+            // PaxCore's credential world is a single uid, so
+            // accept and succeed like the pair above.
+            203 | 204 | 208 | 210 => 0,
             64 => self.ppid,    // getppid
             224 => self.pid,    // gettid (no threads yet: tid == pid)
             _ => self.handle2(cpu, mem, nr),
