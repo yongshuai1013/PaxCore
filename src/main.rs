@@ -1,3 +1,4 @@
+mod binder;
 mod block;
 mod cpu;
 mod elf;
@@ -246,6 +247,7 @@ fn main() {
         block_streak: 0,
         cleartid: 0,
         blocks_dirty: false,
+        binder_wait: false,
     };
     let mut sched = Scheduler {
         procs: vec![init],
@@ -303,6 +305,10 @@ struct Process {
     /// shared memory; the scheduler then flushes the block caches
     /// of every process sharing this address space.
     blocks_dirty: bool,
+    /// Parked in a binder BINDER_WRITE_READ with an empty inbox:
+    /// skipped by the picker until the binder core queues work
+    /// for its group (or a signal becomes deliverable).
+    binder_wait: bool,
 }
 
 enum SliceEnd {
@@ -311,6 +317,7 @@ enum SliceEnd {
     Wait4(usize, i32, u32, u32),
     Exec(usize, String, Vec<String>, Vec<String>),
     WouldBlock(usize),
+    BinderWait(usize),
     Clone(usize, u32, u32, u32, u32, u32),
     SendSignal(usize, u32, Option<u32>, u32),
     SigReturn(usize),
@@ -346,21 +353,47 @@ impl Scheduler {
             for k in 0..self.procs.len() {
                 let i = (cursor + k) % self.procs.len();
                 let p = &self.procs[i];
-                if p.zombie.is_none() && p.wait_req.is_none() {
-                    picked = Some(i);
-                    break;
+                if p.zombie.is_some() || p.wait_req.is_some() {
+                    continue;
                 }
+                if p.binder_wait {
+                    // Parked on an empty binder inbox: runnable
+                    // again once the core queues work for its
+                    // group, or a signal is deliverable.
+                    let core = p.sys.binder.borrow();
+                    let has_work = core.has_inbox(p.tgid);
+                    drop(core);
+                    let sig_ready = p.sys.pending & !p.sys.sig_mask != 0;
+                    if !has_work && !sig_ready {
+                        continue;
+                    }
+                }
+                picked = Some(i);
+                break;
             }
             let idx = match picked {
                 Some(i) => i,
                 None => {
                     // Nobody runnable: either only zombies remain
                     // (their parents are gone; reap silently and
-                    // finish with the initial process's fate) or a
-                    // genuine wait deadlock, which a process tree
-                    // cannot form -- say so loudly if it happens.
+                    // finish with the initial process's fate) or
+                    // every live process is parked on binder --
+                    // a booted system at idle, which is a success
+                    // state for a VM core, not a deadlock. Anything
+                    // else is a genuine wait deadlock.
                     if self.procs.iter().all(|p| p.zombie.is_some()) {
                         return self.procs[0].zombie.unwrap_or(0);
+                    }
+                    if self
+                        .procs
+                        .iter()
+                        .filter(|p| p.zombie.is_none())
+                        .all(|p| p.binder_wait)
+                    {
+                        eprintln!(
+                            "[paxcore] system idle: all live processes are waiting on binder"
+                        );
+                        return 0;
                     }
                     panic!("[paxcore] scheduler deadlock: all processes blocked in wait4");
                 }
@@ -387,6 +420,11 @@ impl Scheduler {
                 }
                 SliceEnd::Exec(idx, path, argv, envp) => {
                     self.do_exec(idx, &path, &argv, &envp);
+                }
+                SliceEnd::BinderWait(idx) => {
+                    let p = &mut self.procs[idx];
+                    p.binder_wait = true;
+                    p.retry_syscall = true;
                 }
                 SliceEnd::WouldBlock(idx) => {
                     let p = &mut self.procs[idx];
@@ -453,8 +491,10 @@ impl Scheduler {
                 syscall::Outcome::Continue => {
                     self.procs[idx].retry_syscall = false;
                     self.procs[idx].block_streak = 0;
+                    self.procs[idx].binder_wait = false;
                 }
                 syscall::Outcome::WouldBlock => return SliceEnd::WouldBlock(idx),
+                syscall::Outcome::BinderWait => return SliceEnd::BinderWait(idx),
                 syscall::Outcome::ExitThread(code) => {
                     return SliceEnd::ExitThread(idx, code);
                 }
@@ -562,6 +602,11 @@ impl Scheduler {
                             self.total_steps += self.procs[idx].cpu.steps - start_steps;
                             self.procs[idx].retry_syscall = true;
                             return SliceEnd::WouldBlock(idx);
+                        }
+                        syscall::Outcome::BinderWait => {
+                            self.total_steps += self.procs[idx].cpu.steps - start_steps;
+                            self.procs[idx].retry_syscall = true;
+                            return SliceEnd::BinderWait(idx);
                         }
                         syscall::Outcome::ExitThread(code) => {
                             self.total_steps += self.procs[idx].cpu.steps - start_steps;
@@ -751,6 +796,7 @@ impl Scheduler {
                     0
                 },
                 blocks_dirty: false,
+                binder_wait: false,
             }
         };
         if flags & CLONE_PARENT_SETTID != 0 && ptid != 0 {
@@ -1014,6 +1060,13 @@ impl Scheduler {
         if tgid == 100 {
             return Some(exit_code);
         }
+        // Binder: the group's nodes die with it (death
+        // notifications and handle cleanup ride along).
+        self.procs[idx]
+            .sys
+            .binder
+            .borrow_mut()
+            .proc_died(tgid);
         // Turn the caller into the group's zombie shell, drop
         // every other member (remove from the back so indices
         // stay valid).
@@ -1062,6 +1115,7 @@ impl Scheduler {
                 block_streak: 0,
                 cleartid: 0,
                 blocks_dirty: false,
+                binder_wait: false,
             }
         };
         self.procs[parent_idx].cpu.r[0] = child_pid;

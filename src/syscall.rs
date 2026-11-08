@@ -65,6 +65,13 @@ pub enum Outcome {
     /// untouched; the scheduler parks the process and re-issues
     /// this syscall when it is scheduled again.
     WouldBlock,
+    /// A binder BINDER_WRITE_READ consumed its write side but
+    /// has nothing to deliver on the read side. The scheduler
+    /// parks the process (without counting it toward the pipe
+    /// EAGAIN streak) and re-issues the ioctl once the binder
+    /// core has inbox work for it; the guest's write_consumed
+    /// field makes the re-issue skip the write side.
+    BinderWait,
     /// clone(120) with its raw arguments (ARM order: flags,
     /// stack, parent_tid, tls, child_tid). Thread creation and
     /// its sharing flags are the scheduler's business.
@@ -130,6 +137,9 @@ pub struct Syscalls {
     pub sig_mask: u64,
     /// This thread's own pending signals.
     pub pending: u64,
+    /// The in-core binder driver, shared by every task in the
+    /// run (binder IPC crosses process boundaries by design).
+    pub binder: std::rc::Rc<std::cell::RefCell<crate::binder::BinderCore>>,
 }
 
 fn err(code: i32) -> u32 {
@@ -185,6 +195,7 @@ impl Syscalls {
             sighand: std::rc::Rc::new(std::cell::RefCell::new(SigShared::default())),
             sig_mask: 0,
             pending: 0,
+            binder: std::rc::Rc::new(std::cell::RefCell::new(crate::binder::BinderCore::new())),
         }
     }
 
@@ -247,6 +258,7 @@ impl Syscalls {
                 },
                 crate::fs::FdKind::Dir(p) => crate::fs::FdKind::Dir(p.clone()),
                 crate::fs::FdKind::Pipe(e) => crate::fs::FdKind::Pipe(e.clone()),
+                crate::fs::FdKind::Binder => crate::fs::FdKind::Binder,
             };
             fds.insert(
                 *num,
@@ -279,6 +291,7 @@ impl Syscalls {
             })),
             sig_mask: self.sig_mask,
             pending: 0,
+            binder: self.binder.clone(),
         }
     }
 
@@ -296,6 +309,17 @@ impl Syscalls {
             Some(b) => self.fs.resolve_from(b, path),
             None => self.fs.resolve(path),
         };
+        // Devices the core services itself.
+        if guest_abs == "/dev/binder" {
+            let fd = Fd::new(FdKind::Binder);
+            return self.fs.alloc_fd(fd) as u32;
+        }
+        if guest_abs == "/dev/urandom" {
+            if let Ok(f) = std::fs::File::open("/dev/urandom") {
+                let fd = Fd::new(FdKind::File(f));
+                return self.fs.alloc_fd(fd) as u32;
+            }
+        }
         let host = self.fs.host_path(&guest_abs);
         let md = std::fs::metadata(&host);
         let o_creat = flags & 0x40 != 0;
@@ -395,6 +419,12 @@ impl Syscalls {
 
     pub fn handle(&mut self, cpu: &mut Cpu, mem: &mut Mem) -> Outcome {
         let nr = cpu.r[7];
+        if (nr == 37 || nr == 126) && std::env::var_os("PAXCORE_BINDER_DEBUG").is_some() {
+            eprintln!(
+                "[syscall] nr={nr} from pc=0x{:08x} lr=0x{:08x} (pid {})",
+                cpu.r[15], cpu.r[14], self.tgid
+            );
+        }
         if std::env::var_os("PAXCORE_TRACE").is_some() {
             let path_note = match nr {
                 5 | 10 | 12 | 33 | 39 | 85 | 195 | 196 => {
@@ -409,6 +439,16 @@ impl Syscalls {
             );
         }
         let (a0, a1, a2, a3, a4) = (cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4]);
+        if nr == 54
+            && matches!(
+                self.fs.fds.get(&(a0 as i32)).map(|f| &f.kind),
+                Some(FdKind::Binder)
+            )
+        {
+            // ioctl on /dev/binder: served by the in-core driver
+            // (it can park, so it bypasses the u32 chain).
+            return self.binder_ioctl(cpu, mem, a1, a2);
+        }
         let ret: u32 = match nr {
             1 => return Outcome::ExitThread(a0),  // exit (thread)
             248 => return Outcome::ExitGroup(a0), // exit_group
@@ -793,6 +833,89 @@ impl Syscalls {
         }
     }
 
+    /// ioctl() on a /dev/binder fd.
+    fn binder_ioctl(&mut self, cpu: &mut Cpu, mem: &mut Mem, req: u32, arg: u32) -> Outcome {
+        use crate::binder as B;
+        let pid = self.tgid;
+        match req {
+            B::BINDER_VERSION => {
+                put32(mem, arg, 7);
+                done(cpu, 0)
+            }
+            B::BINDER_SET_MAX_THREADS | B::BINDER_SET_IDLE_TIMEOUT | B::BINDER_SET_IDLE_PRIORITY => {
+                done(cpu, 0)
+            }
+            B::BINDER_SET_CONTEXT_MGR => {
+                if self.binder.borrow_mut().set_context_mgr(pid) {
+                    done(cpu, 0)
+                } else {
+                    done(cpu, err(16)) // EBUSY: already registered
+                }
+            }
+            B::BINDER_THREAD_EXIT => {
+                self.binder.borrow_mut().proc(pid).looper = false;
+                done(cpu, 0)
+            }
+            B::BINDER_WRITE_READ => self.binder_write_read(cpu, mem, arg),
+            _ => done(cpu, err(ENOTTY)),
+        }
+    }
+
+    /// BINDER_WRITE_READ. The guest struct (24 bytes):
+    /// +0 write_size, +4 write_consumed, +8 write_buffer,
+    /// +12 read_size, +16 read_consumed, +20 read_buffer.
+    /// The write side is processed first (resuming from the
+    /// incoming write_consumed, which is how a parked call
+    /// re-issued by the scheduler avoids re-sending commands);
+    /// then the read side drains whatever the core has queued.
+    /// With an empty inbox the call parks as Outcome::BinderWait.
+    fn binder_write_read(&mut self, cpu: &mut Cpu, mem: &mut Mem, bwr: u32) -> Outcome {
+        let pid = self.tgid;
+        let ws = mem.read_u32(bwr);
+        let wc0 = mem.read_u32(bwr + 4);
+        let wb = mem.read_u32(bwr + 8);
+        let rs = mem.read_u32(bwr + 12);
+        let rb = mem.read_u32(bwr + 20);
+        if ws > wc0 {
+            let n = (ws - wc0) as usize;
+            let mut bytes = vec![0u8; n];
+            mem.read_slice(wb + wc0, &mut bytes);
+            let consumed = {
+                let mref = &*mem;
+                let mut fetch = |td: &[u8]| -> (Vec<u8>, Vec<u32>) {
+                    let dptr = u32::from_le_bytes([td[32], td[33], td[34], td[35]]);
+                    let optr = u32::from_le_bytes([td[36], td[37], td[38], td[39]]);
+                    let dsz = u32::from_le_bytes([td[24], td[25], td[26], td[27]]) as usize;
+                    let osz = u32::from_le_bytes([td[28], td[29], td[30], td[31]]) as usize;
+                    let mut data = vec![0u8; dsz];
+                    if dsz > 0 {
+                        mref.read_slice(dptr, &mut data);
+                    }
+                    let mut offs = Vec::with_capacity(osz / 4);
+                    for k in 0..osz / 4 {
+                        offs.push(mref.read_u32(optr + 4 * k as u32));
+                    }
+                    (data, offs)
+                };
+                self.binder
+                    .borrow_mut()
+                    .process_write(pid, &bytes, &mut fetch)
+            };
+            put32(mem, bwr + 4, wc0 + consumed as u32);
+        }
+        if rs == 0 {
+            return done(cpu, 0);
+        }
+        let drained = self.binder.borrow_mut().drain(pid, mem, rb, rs);
+        if drained > 0 {
+            put32(mem, bwr + 16, drained);
+            return done(cpu, 0);
+        }
+        // Nothing to deliver: park until the core has inbox work.
+        put32(mem, bwr + 16, 0);
+        Outcome::BinderWait
+    }
+
     fn clone_fd(&self, n: i32) -> Option<Fd> {
         let src = self.fs.fds.get(&n)?;
         let kind = match &src.kind {
@@ -801,6 +924,7 @@ impl Syscalls {
             FdKind::StdErr => FdKind::StdErr,
             FdKind::Dir(p) => FdKind::Dir(p.clone()),
             FdKind::Pipe(e) => FdKind::Pipe(e.clone()),
+            FdKind::Binder => FdKind::Binder,
             FdKind::File(f) => match f.try_clone() {
                 Ok(c) => FdKind::File(c),
                 Err(_) => return None,
@@ -1091,6 +1215,14 @@ impl Syscalls {
                         }
                     } else {
                         return err(EBADF);
+                    }
+                }
+                if let Some(fd) = self.fs.fds.get(&(a4 as i32)) {
+                    if matches!(fd.kind, FdKind::Binder) {
+                        // The binder receive arena: the driver
+                        // writes transaction payloads here.
+                        let pid = self.tgid;
+                        self.binder.borrow_mut().set_arena(pid, base, len);
                     }
                 }
                 base

@@ -20,6 +20,9 @@ pub enum FdKind {
     File(File),
     Dir(PathBuf),
     Pipe(PipeEnd),
+    /// /dev/binder: serviced entirely by the in-core binder
+    /// driver (crate::binder) through the ioctl path.
+    Binder,
 }
 
 /// Shared pipe buffer with live-end counts. Counts are kept by

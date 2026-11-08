@@ -44,10 +44,12 @@ impl Cpu {
         if let Some(wp) = self.watch_pc {
             if pc == wp {
                 eprintln!(
-                    "[watchpc] pc=0x{pc:08x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x} r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x} sp={:#010x} lr={:#010x}",
+                    "[watchpc] steps={} pc=0x{pc:08x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x} r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x} sp={:#010x} lr={:#010x} nzcv={}{}{}{}",
+                    self.steps,
                     self.r[0], self.r[1], self.r[2], self.r[3], self.r[4], self.r[5],
                     self.r[6], self.r[7], self.r[8], self.r[9], self.r[10], self.r[11], self.r[12],
-                    self.r[13], self.r[14]
+                    self.r[13], self.r[14],
+                    self.n as u8, self.z as u8, self.c as u8, self.v as u8
                 );
             }
         }
@@ -616,6 +618,108 @@ impl Cpu {
                 return Step::Continue;
             }
         }
+        // VFP load/store (single + multiple): encodings nailed
+        // by NDK-assembled samples (vpush {d8} = ED2D 8B02,
+        // vpop {d8-d11} = ECBD 8B08, vldr d0,[sp,#16] = ED9D
+        // 0B04, vstr s3,[r0] = EDC0 1A00, vpush {d17} = ED6D
+        // 1B02). Fields: Rn = hw[3:0], P/U/W/L = hw[8/7/5/4],
+        // D (register high bit) = hw[6], Vd = hw2[15:12],
+        // double = hw2[8], imm8 = hw2[7:0]. Single-transfer
+        // form is P=1,W=0 with offset imm8*4; multiple form is
+        // everything else, count = imm8 (singles) or imm8/2
+        // (doubles).
+        if (hw & 0xFE00) == 0xEC00 && (hw2 & 0x0E00) == 0x0A00 {
+            let rn = (hw & 0xF) as usize;
+            let p = (hw >> 8) & 1 == 1;
+            let u = (hw >> 7) & 1 == 1;
+            let w = (hw >> 5) & 1 == 1;
+            let load = (hw >> 4) & 1 == 1;
+            let dbl = (hw2 >> 8) & 1 == 1;
+            let dbit = ((hw >> 6) & 1) as u32;
+            let vd = (hw2 >> 12) & 0xF;
+            let reg0 = if dbl {
+                ((dbit << 4) | vd) as usize
+            } else {
+                ((vd << 1) | dbit) as usize
+            };
+            let imm8 = (hw2 & 0xFF) as u32;
+            // One register's worth of bits to/from memory.
+            macro_rules! xfer {
+                ($reg:expr, $addr:expr) => {
+                    if dbl {
+                        let r = $reg;
+                        let a = $addr;
+                        if load {
+                            let lo = mem.read_u32(a) as u64;
+                            let hi = mem.read_u32(a + 4) as u64;
+                            self.d[r] = lo | (hi << 32);
+                        } else {
+                            let b = self.d[r];
+                            mem.write_u32(a, b as u32);
+                            mem.write_u32(a + 4, (b >> 32) as u32);
+                        }
+                    } else {
+                        let r = $reg;
+                        let a = $addr;
+                        if load {
+                            let v = mem.read_u32(a);
+                            if r % 2 == 0 {
+                                self.d[r / 2] =
+                                    (self.d[r / 2] & 0xFFFF_FFFF_0000_0000) | v as u64;
+                            } else {
+                                self.d[r / 2] = (self.d[r / 2] & 0x0000_0000_FFFF_FFFF)
+                                    | ((v as u64) << 32);
+                            }
+                        } else {
+                            let v = if r % 2 == 0 {
+                                self.d[r / 2] as u32
+                            } else {
+                                (self.d[r / 2] >> 32) as u32
+                            };
+                            mem.write_u32(a, v);
+                        }
+                    }
+                };
+            }
+            if p && !w {
+                // VLDR / VSTR (immediate offset, no writeback)
+                let base = if rn == REG_PC {
+                    pc4 & !3
+                } else {
+                    self.r[rn]
+                };
+                let addr = if u {
+                    base.wrapping_add(imm8 * 4)
+                } else {
+                    base.wrapping_sub(imm8 * 4)
+                };
+                xfer!(reg0, addr);
+            } else {
+                // VSTM / VLDM (IA/DB/IB/DA from P/U)
+                let size: u32 = if dbl { 8 } else { 4 };
+                let count = if dbl { imm8 / 2 } else { imm8 };
+                let total = count * size;
+                let base = self.r[rn];
+                let start = match (p, u) {
+                    (false, true) => base,
+                    (true, false) => base.wrapping_sub(total),
+                    (true, true) => base.wrapping_add(size),
+                    (false, false) => base.wrapping_sub(total).wrapping_add(size),
+                };
+                for i in 0..count as usize {
+                    xfer!(reg0 + i, start.wrapping_add((i as u32) * size));
+                }
+                if w {
+                    self.r[rn] = if u {
+                        base.wrapping_add(total)
+                    } else {
+                        base.wrapping_sub(total)
+                    };
+                }
+            }
+            self.r[REG_PC] = next;
+            return Step::Continue;
+        }
         // MRC / MCR (coprocessor register transfers):
         // mirrors the ARM-mode handler in cpu.rs with the
         // fields extracted from the reassembled 32-bit word.
@@ -860,8 +964,59 @@ impl Cpu {
             self.r[REG_PC] = next;
             return Step::Continue;
         }
-        // Data processing (immediate): bits 15-11 == 11110
-        if (hw >> 11) == 0x1E && (hw2 & 0x8000) == 0 {
+        // Bitfield family (SBFX/BFI/BFC/UBFX): hw1 == 0xF34x /
+        // 0xF36x / 0xF3Cx. These share the 11110 top bits with
+        // data-processing-immediate and were silently executed
+        // as ALU ops (UBFX F3C0 0240 became RSB r2, r0, #0x40 --
+        // the phantom 0x40 that killed dlmalloc's tree index in
+        // lbprobe). Fields verified against guest/bitfield.s
+        // objdump: Rn = hw[3:0], Rd = hw2[11:8],
+        // lsb = imm3:imm2 (hw2[14:12] : hw2[7:6]), and hw2[5:0]
+        // holds width-1 (SBFX/UBFX) or msb (BFI/BFC).
+        if matches!(hw & 0xFFF0, 0xF340 | 0xF360 | 0xF3C0) {
+            let rn = (hw & 0xF) as usize;
+            let rd = ((hw2 >> 8) & 0xF) as usize;
+            let lsb = (((hw2 >> 12) & 0x7) << 2) | ((hw2 >> 6) & 0x3);
+            let src = if rn == REG_PC { pc4 } else { self.r[rn] };
+            match hw & 0xFFF0 {
+                0xF3C0 => {
+                    // UBFX
+                    let width = (hw2 & 0x3F) + 1;
+                    let mask = if width >= 32 {
+                        u32::MAX
+                    } else {
+                        (1u32 << width) - 1
+                    };
+                    self.r[rd] = (src >> lsb) & mask;
+                }
+                0xF340 => {
+                    // SBFX
+                    let width = (hw2 & 0x3F) + 1;
+                    let shifted = (src >> lsb) << (32 - width);
+                    self.r[rd] = ((shifted as i32) >> (32 - width)) as u32;
+                }
+                _ => {
+                    // BFI (Rn != 1111) / BFC (Rn == 1111)
+                    let msb = hw2 & 0x3F;
+                    let width = msb - lsb + 1;
+                    let mask = ((1u32 << width) - 1) << lsb;
+                    let ins = if rn == 15 {
+                        0
+                    } else {
+                        (src << lsb) & mask
+                    };
+                    self.r[rd] = (self.r[rd] & !mask) | ins;
+                }
+            }
+            self.r[REG_PC] = next;
+            return Step::Continue;
+        }
+        // Data processing (immediate): bits 15-11 == 11110.
+        // The rest of the 0xF3xx page (SSAT/USAT forms) is not
+        // plain-binary-immediate space; exclude it so those
+        // encodings fail loudly at unimp instead of running as
+        // the wrong ALU op.
+        if (hw >> 11) == 0x1E && (hw2 & 0x8000) == 0 && (hw & 0xFF00) != 0xF300 {
             let opc = (hw >> 5) & 0xF;
             let set = (hw >> 4) & 1 == 1;
             let rn = (hw & 0xF) as usize;
@@ -919,7 +1074,12 @@ impl Cpu {
             let rm = (hw2 & 0xF) as usize;
             let raw = if rn == REG_PC { pc4 } else { self.r[rn] };
             let amt = self.r[rm] & 0xFF;
-            let (val, carry) = self.shift_reg(raw, typ, amt);
+            // Register-specified shift: amount 0 means NO shift
+            // (the immediate form's LSR/ASR 0-encodes-32 and
+            // ROR 0-encodes-RRX rules do not apply here). Using
+            // shift_reg here zeroed lsrs.w-by-0 in dlmalloc's
+            // bitmap scan and sent it to the wrong bin.
+            let (val, carry) = self.shift_reg_regform(raw, typ, amt);
             if set {
                 self.set_nz(val);
                 self.c = carry;
