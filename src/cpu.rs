@@ -225,7 +225,7 @@ impl Cpu {
         let word = self.rd(mem, pc);
         self.steps += 1;
         if self.trace && self.steps >= self.trace_after {
-            eprintln!("[trace] A pc=0x{pc:08x} w=0x{word:08x} r0=0x{:08x} r1=0x{:08x}", self.r[0], self.r[1]);
+            eprintln!("[trace] A pc=0x{pc:08x} w=0x{word:08x} r0=0x{:08x} r1=0x{:08x} r3=0x{:08x} r4=0x{:08x} sp=0x{:08x} lr=0x{:08x}", self.r[0], self.r[1], self.r[3], self.r[4], self.r[13], self.r[14]);
         }
         let next_pc = pc.wrapping_add(4);
         // BLX immediate: 1111 101 H imm24 -- unconditional,
@@ -366,13 +366,23 @@ impl Cpu {
                 return Step::Continue;
             }
         }
-        // Bitfield family (SBFX/BFC+BFI/UBFX): bits 27-20 ==
-        // 01111010 / 01111100 / 01111110. Must precede the SDT
+        // Bitfield family (SBFX/BFC+BFI/UBFX): bits 27-21 ==
+        // 0111101 / 0111110 / 0111111. Must precede the SDT
         // decode: these live in the same bits 27-25 == 011 space
-        // but have bit 4 set, which SDT never does.
+        // but have bit 4 set, which SDT never does. The gate
+        // must NOT include bit 20: it is the top bit of the
+        // width/msb field, so gating on bits 27-20 (0x7A/0x7C/
+        // 0x7E only) let every encoding with width/msb >= 16
+        // fall through to the SDT decode -- zlib's
+        // `bfi r12, r0, #16, #16` (msb=31) became a stray LDRB
+        // and silently corrupted the values it packed, which
+        // surfaced as "invalid literal/lengths set" from
+        // inflate and GB dalvikvm being unable to load any
+        // deflated jar.
         {
-            let top8 = (word >> 20) & 0xFF;
-            if matches!(top8, 0x7A | 0x7C | 0x7E) && (word >> 4) & 0x3 == 0x1 {
+            let top7 = (word >> 21) & 0x7F;
+            if matches!(top7, 0x3D | 0x3E | 0x3F) && (word >> 4) & 0x3 == 0x1 {
+                let top8 = top7 << 1;
                 // Field layout (probe-verified, 0xE7EA0A57 ==
                 // ubfx r0, r7, #20, #11): bits 19-16 hold
                 // width-1 for SBFX/UBFX and msb for BFC/BFI,
@@ -999,7 +1009,7 @@ impl Cpu {
         sign * (1.0 + frac) * 2f64.powi(e)
     }
 
-    fn exec_vfp(&mut self, mem: &mut Mem, word: u32) -> bool {
+    pub(crate) fn exec_vfp(&mut self, mem: &mut Mem, word: u32) -> bool {
         let pc = self.r[REG_PC];
         let next_pc = pc.wrapping_add(4);
         let top4 = (word >> 24) & 0xF;
@@ -1298,8 +1308,16 @@ impl Cpu {
                 self.r[REG_PC] = next_pc;
                 return true;
             }
-            // Unary / immediate / convert family: op == 1011.
-            if op == 0xB {
+            // Unary / immediate / convert family: op == 1011,
+            // plus the f32 mirror at op == 1111 (bit 23 is the
+            // precision selector for this family: vmov.f32
+            // s15, #0.5 == 0xEEF67A00 vs vmov.f64 == 0xEEB6..;
+            // every sub-check below keys on fields that keep
+            // the two apart -- VCVT-to-int has bits 7-6 != 00,
+            // VCVT-between needs bits 19-16 == 7, and precision
+            // itself comes from cp/dbl, so widening the gate
+            // cannot misroute an f64 encoding).
+            if matches!(op, 0xB | 0xF) {
                 // VCVT between f32 and f64 (field table machine-
                 // verified: bits 19-16 == 7, bits 7-6 == 11;
                 // bits 11-8 == 0xA means f64 destination from an

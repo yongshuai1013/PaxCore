@@ -54,7 +54,7 @@ impl Cpu {
             }
         }
         if self.trace && self.steps >= self.trace_after {
-            eprintln!("[trace] T pc=0x{pc:08x} hw=0x{hw:04x} r0=0x{:08x} r1=0x{:08x}", self.r[0], self.r[1]);
+            eprintln!("[trace] T pc=0x{pc:08x} hw=0x{hw:04x} r0=0x{:08x} r1=0x{:08x} r3=0x{:08x} r4=0x{:08x} sp=0x{:08x} lr=0x{:08x}", self.r[0], self.r[1], self.r[3], self.r[4], self.r[13], self.r[14]);
         }
         let is32 = matches!(hw >> 11, 0x1D | 0x1E | 0x1F);
         let len: u32 = if is32 { 4 } else { 2 };
@@ -747,6 +747,17 @@ impl Cpu {
                     self.r[REG_PC] = next;
                     return Step::Continue;
                 }
+                if cp == 0xA || cp == 0xB {
+                    // VFP data-processing / register-transfer
+                    // encodings appear inline in Thumb streams
+                    // (GB libraries are full of them: vmov.f32
+                    // s15, #0.5 == EEF6 7A00 in libicuuc). The
+                    // bit layout is the ARM one with cond=1110,
+                    // so reassemble and reuse the ARM decoder.
+                    if self.exec_vfp(mem, word) {
+                        return Step::Continue;
+                    }
+                }
                 self.unimp(hw);
             }
         }
@@ -1060,13 +1071,65 @@ impl Cpu {
             }
             return Step::Continue;
         }
+        // Sign/zero extend (Thumb-2), with optional add:
+        // hw == 0xFAxx, hw2[15:12] == 1111, hw2[7:6] == 0b10.
+        // op = hw[7:4]: 0 SXTH, 1 UXTH, 2 SXTB16, 3 UXTB16,
+        // 4 SXTB, 5 UXTB; Rn = hw[3:0] (15 = plain extend,
+        // otherwise extend-and-add), Rd = hw2[11:8],
+        // Rm = hw2[3:0], rotation = hw2[5:4] * 8 (ROR applied
+        // to Rm first). Encodings pinned by assembling the
+        // matrix with the NDK assembler (guest/uxthprobe):
+        // this family shares the 0xFA prefix with the
+        // shift-by-register group below and was silently
+        // executed as a shift of the PC -- libdvm's
+        // dvmLinkClass does `uxth.w lr, r3; cmp r3, lr` to
+        // sanity-check interface method counts, and the
+        // garbage result made every interface look oversized,
+        // killing VM bootstrap.
+        if (hw >> 8) == 0xFA && (hw2 >> 12) == 0xF && ((hw2 >> 6) & 0x3) == 0x2 {
+            let op = (hw >> 4) & 0xF;
+            if matches!(op, 0 | 1 | 2 | 3 | 4 | 5) {
+                let rn = (hw & 0xF) as usize;
+                let rd = ((hw2 >> 8) & 0xF) as usize;
+                let rm = (hw2 & 0xF) as usize;
+                let rot = ((hw2 >> 4) & 0x3) * 8;
+                let raw = if rm == REG_PC { pc4 } else { self.r[rm] };
+                let src = raw.rotate_right(rot);
+                let ext = match op {
+                    0 => (src as u16 as i16 as i32) as u32,
+                    1 => src & 0xFFFF,
+                    2 => {
+                        let lo = (src as u8 as i8 as i32) as u32;
+                        let hi = ((src >> 16) as u8 as i8 as i32) as u32;
+                        (lo & 0xFFFF) | (hi << 16)
+                    }
+                    3 => (src & 0xFF) | ((src >> 16) & 0xFF) << 16,
+                    4 => (src as u8 as i8 as i32) as u32,
+                    _ => src & 0xFF,
+                };
+                let val = if rn == REG_PC {
+                    ext
+                } else {
+                    self.r[rn].wrapping_add(ext)
+                };
+                if rd == REG_PC {
+                    self.jump_to(val);
+                } else {
+                    self.r[rd] = val;
+                    self.r[REG_PC] = next;
+                }
+                return Step::Continue;
+            }
+        }
         // Shift by register (Thumb-2): hw == 0xFAxx, verified
         // against guest/t2dp.s -- type = hw[6:5] (LSL/LSR/ASR/
         // ROR in shift_reg numbering), S = hw[4], source =
         // hw[3:0], Rd = hw2[11:8], amount register = hw2[3:0],
-        // marked by hw2[15:12] == 1111. The GB linker uses
-        // LSRS.W in its table walks.
-        if (hw >> 8) == 0xFA && (hw2 >> 12) == 0xF {
+        // marked by hw2[15:12] == 1111 AND hw2[7:4] == 0 (the
+        // extend family above owns hw2[7:6] == 0b10; the old
+        // key without this clause ate UXTH/UXTB encodings).
+        // The GB linker uses LSRS.W in its table walks.
+        if (hw >> 8) == 0xFA && (hw2 >> 12) == 0xF && (hw2 & 0x00F0) == 0 {
             let typ = (hw >> 5) & 0x3;
             let set = (hw >> 4) & 1 == 1;
             let rn = (hw & 0xF) as usize;
