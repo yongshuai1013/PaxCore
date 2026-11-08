@@ -28,6 +28,15 @@ pub enum FdKind {
     /// (1,3) null, (1,5) zero, (5,1)/(5,0) console/tty,
     /// everything else an inert sink/source.
     CharDev { major: u32, minor: u32 },
+    /// /dev/ashmem: an anonymous shared-memory region. The
+    /// backing is created empty, sized by ASHMEM_SET_SIZE, and
+    /// aliased by MAP_SHARED mmaps of this fd. MAP_PRIVATE
+    /// mmaps take the snapshot path (zero-filled), which
+    /// matches how Dalvik consumes its heap region.
+    Ashmem {
+        size: usize,
+        backing: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    },
     /// A connected AF_UNIX stream endpoint. rx drains what the
     /// peer wrote; tx carries this end's writes (the two
     /// PipeShared queues of the pair cross over).
@@ -316,6 +325,7 @@ impl Fd {
                 out.fill(0);
                 Ok(out.len())
             }
+            FdKind::Ashmem { .. } => Ok(0), // regions are mmap-only
             FdKind::CharDev { .. } => Ok(0), // null & co: EOF
             FdKind::UnixStream { rx, .. } => {
                 let mut q = rx.shared.q.lock().unwrap();
@@ -350,6 +360,17 @@ impl Fd {
                 // /dev/kmsg: the guest kernel log -- mirror it
                 // to the host's stderr so init's own diagnostics
                 // stay visible while debugging the boot.
+                std::io::stderr().write(data)
+            }
+            FdKind::Ashmem { .. } => Ok(data.len()), // sink
+            FdKind::CharDev { major: 250, .. } => {
+                // /dev/log/*: the Android logger devices.
+                // Entries carry a binary header (pid, time,
+                // priority, tag); mirror the raw bytes to the
+                // host's stderr -- assert messages from the
+                // framework libraries land here, and without
+                // these nodes the abort that follows them is
+                // completely silent.
                 std::io::stderr().write(data)
             }
             FdKind::CharDev { .. } => Ok(data.len()), // sink

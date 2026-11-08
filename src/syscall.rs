@@ -316,6 +316,10 @@ impl Syscalls {
                         pending: pending.clone(),
                     }
                 }
+                crate::fs::FdKind::Ashmem { size, backing } => crate::fs::FdKind::Ashmem {
+                    size: *size,
+                    backing: backing.clone(),
+                },
             };
             fds.insert(
                 *num,
@@ -407,6 +411,23 @@ impl Syscalls {
                 let fd = Fd::new(FdKind::File(f));
                 return self.fs.alloc_fd(fd) as u32;
             }
+        }
+        // /dev/ashmem: anonymous shared memory (see fs.rs).
+        if guest_abs == "/dev/ashmem" {
+            let fd = Fd::new(FdKind::Ashmem {
+                size: 0,
+                backing: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            });
+            return self.fs.alloc_fd(fd) as u32;
+        }
+        // The Android logger devices (kernel driver nodes on
+        // real hardware; init's ueventd would create them).
+        if guest_abs.starts_with("/dev/log/") {
+            let fd = Fd::new(FdKind::CharDev {
+                major: 250,
+                minor: 0,
+            });
+            return self.fs.alloc_fd(fd) as u32;
         }
         // Nodes registered by mknod (GB dev_t encoding:
         // major = dev >> 8, minor = dev & 0xff).
@@ -1084,6 +1105,36 @@ impl Syscalls {
             }
             54 => {
                 // ioctl(fd, request, arg)
+                if let Some(fd) = self.fs.fds.get_mut(&(a0 as i32)) {
+                    if let FdKind::Ashmem { size, backing } = &mut fd.kind {
+                        // Numbers from the guest's own
+                        // linux/ashmem.h (_IOC with type 0x77).
+                        return match a1 {
+                            0x41007701 => 0, // SET_NAME (accepted)
+                            0x81007702 => {
+                                // GET_NAME
+                                let mut buf = [0u8; 256];
+                                buf[..10].copy_from_slice(b"dev/ashmem");
+                                mem.write_slice(a2, &buf);
+                                0
+                            }
+                            0x40047703 => {
+                                // SET_SIZE
+                                *size = a2 as usize;
+                                backing.borrow_mut().resize(*size, 0);
+                                0
+                            }
+                            0x00007704 => *size as u32, // GET_SIZE
+                            0x40047705 => 0,            // SET_PROT_MASK
+                            0x00007706 => 0x7,          // GET_PROT_MASK: RWX
+                            0x40087707 => 0, // PIN: ASHMEM_NOT_PURGED
+                            0x40087708 => 0, // UNPIN: ASHMEM_NOT_PURGED
+                            0x00007709 => 1, // GET_PIN_STATUS: pinned
+                            0x0000770A => 0, // PURGE_ALL_CACHES
+                            _ => err(ENOTTY),
+                        };
+                    }
+                }
                 match a1 {
                     0x5401 => err(ENOTTY), // TCGETS: not a tty
                     0x5413 => {
@@ -1283,6 +1334,10 @@ impl Syscalls {
                 Ok(c) => FdKind::File(c),
                 Err(_) => return None,
             },
+            FdKind::Ashmem { size, backing } => FdKind::Ashmem {
+                size: *size,
+                backing: backing.clone(),
+            },
         };
         let mut out = Fd::new(kind);
         out.status_flags = src.status_flags;
@@ -1452,6 +1507,7 @@ impl Syscalls {
                         Some(FdKind::StdOut) | Some(FdKind::StdErr) => rev = 0x4,
                         Some(FdKind::File(_)) | Some(FdKind::Dir(_)) => rev = 0x5,
                         Some(FdKind::CharDev { .. }) => rev = 0x5,
+                        Some(FdKind::Ashmem { .. }) => rev = 0x5,
                         Some(FdKind::Binder) => {
                             if self.binder.borrow().has_inbox(self.tgid) {
                                 rev = 0x1;
@@ -1518,6 +1574,24 @@ impl Syscalls {
                     }
                     0
                 }
+            }
+            126 => {
+                // sigprocmask (legacy): same mask state as the
+                // rt_ form, but the set is one 32-bit word.
+                // GB-era bionic calls this during app_process
+                // startup and aborts on ENOSYS.
+                if a2 != 0 {
+                    put32(mem, a2, self.sig_mask as u32);
+                }
+                if a1 != 0 {
+                    let v = mem.read_u32(a1) as u64;
+                    match a0 {
+                        0 => self.sig_mask |= v,  // SIG_BLOCK
+                        1 => self.sig_mask &= !v, // SIG_UNBLOCK
+                        _ => self.sig_mask = v,    // SIG_SETMASK
+                    }
+                }
+                0
             }
             175 => {
                 // rt_sigprocmask(how, set, oldset, size)
@@ -1620,6 +1694,20 @@ impl Syscalls {
                             std::rc::Rc::new(std::cell::RefCell::new(vec![0u8; len as usize]));
                         mem.add_shared(base, len, 0, backing);
                         return base;
+                    }
+                    if let Some(fd) = self.fs.fds.get(&(a4 as i32)) {
+                        if let FdKind::Ashmem { backing, .. } = &fd.kind {
+                            let backing = backing.clone();
+                            let off = (a5 as usize) * 4096;
+                            let mut b = backing.borrow_mut();
+                            let need = off + a1 as usize;
+                            if b.len() < need {
+                                b.resize(need, 0);
+                            }
+                            drop(b);
+                            mem.add_shared(base, len, off, backing);
+                            return base;
+                        }
                     }
                     let fpath = match self.fs.fds.get(&(a4 as i32)) {
                         Some(fd) if matches!(fd.kind, FdKind::File(_)) => fd.path.clone(),
