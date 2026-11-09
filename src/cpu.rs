@@ -1516,18 +1516,27 @@ impl Cpu {
                     return true;
                 }
                 // VCVT from s32/u32 (integer held in an s-register,
-                // converted to float). Field layout verified against
-                // guest-binary samples (0xEEB84B46 vcvt.f64.u32 d4,
-                // s12; 0xEEB87B67 d7, s15; 0xEEF87A67 vcvt.f32.u32
-                // s15, s15): bits 23-16 == 0xB8 (f64 dst) or 0xF8
-                // (f32 dst), dst via the usual d_idx/s_idx packing,
-                // Sm via m_idx_s, bit 7 set = signed source (clean
-                // s32/u32 sample pairs differ only in bit 7).
+                // converted to float). Destination precision is
+                // selected by the coprocessor nibble (bits 11-8):
+                // 0xA = f32 destination, 0xB = f64 -- assembler
+                // table: vcvt.f32.u32 s14, s0 == 0xEEB87A40,
+                // vcvt.f64.u32 d7, s15 == 0xEEB87B67, s32 forms
+                // differ only in bit 7 (set = signed source).
+                // Core bug #15: this arm used to key the
+                // destination precision on bits 23-16 (0xB8 meant
+                // "f64"), so vcvt.f32.u32 wrote d7 instead of s14
+                // and the destination s-register kept its old
+                // value -- libdvm's dvmGetTargetHeapUtilization
+                // (vcvt.f32.u32 s14, s0) therefore always
+                // returned 0.0, and ZygoteInit's finally-restore
+                // of the heap utilization threw
+                // IllegalArgumentException, killing the zygote
+                // after class preloading.
                 let mid8 = (word >> 16) & 0xFF;
                 if mid8 == 0xB8 || mid8 == 0xF8 {
                     let bits = self.get_s_bits(m_idx_s(word));
                     let signed = (word >> 7) & 1 == 1;
-                    if mid8 == 0xB8 {
+                    if mid8 == 0xB8 && ((word >> 8) & 0xF) == 0xB {
                         let v = if signed { bits as i32 as f64 } else { bits as f64 };
                         self.set_d(d_idx(word), v);
                     } else {
