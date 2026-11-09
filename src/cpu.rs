@@ -440,6 +440,48 @@ impl Cpu {
                 return Step::Continue;
             }
         }
+        // SDIV / UDIV (ARMv7 divide extension): bits 27-20
+        // == 0x71 (SDIV) or 0x73 (UDIV), bits 15-12 == 0xF,
+        // bits 7-4 == 0x1. The register fields use the
+        // media-space layout, NOT the data-processing one
+        // (assembler-verified: sdiv r3, r5, r9 ==
+        // 0xE713F915): Rd = bits 19-16, Rm = bits 11-8,
+        // Rn = bits 3-0. Rd = Rn / Rm truncating toward
+        // zero; division by zero yields 0 and INT_MIN / -1
+        // wraps (no trap). GB's ARM-compiled libraries use
+        // these in fixed-point paths (FreeType inside
+        // libskia among them); before this arm existed the
+        // encoding fell into an earlier load/store handler
+        // and silently derailed execution into zero memory:
+        // core bug #13.
+        {
+            let top8 = (word >> 20) & 0xFF;
+            if (top8 == 0x71 || top8 == 0x73)
+                && (word >> 12) & 0xF == 0xF
+                && (word >> 4) & 0xF == 0x1
+            {
+                let rd = ((word >> 16) & 0xF) as usize;
+                let rm = ((word >> 8) & 0xF) as usize;
+                let rn = (word & 0xF) as usize;
+                let a = if rn == REG_PC { pc + 8 } else { self.r[rn] };
+                let b = if rm == REG_PC { pc + 8 } else { self.r[rm] };
+                let r = if top8 == 0x71 {
+                    let (a, b) = (a as i32, b as i32);
+                    if b == 0 {
+                        0
+                    } else {
+                        a.wrapping_div(b) as u32
+                    }
+                } else if b == 0 {
+                    0
+                } else {
+                    a / b
+                };
+                self.r[rd] = r;
+                self.r[REG_PC] = next_pc;
+                return Step::Continue;
+            }
+        }
         // Single data transfer: bits 27-26 == 01
         if (word >> 26) & 0x3 == 0x1 {
             let pre = (word >> 24) & 1 == 1;
