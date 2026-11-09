@@ -1,0 +1,5 @@
+# libpaxcore.so is built by CI into jniLibs; never commit it.
+app/src/main/jniLibs/arm64-v8a/*.so
+.gradle/
+app/build/
+local.properties
