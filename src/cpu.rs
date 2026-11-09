@@ -1296,20 +1296,27 @@ impl Cpu {
             }
             // Multiply-accumulate f32 family (the f64 block
             // above's mirror; encodings assembler-verified:
-            // vmla.f32 0xEE470A08 op 0x4 bit6 0, vmls.f32
-            // 0xEE470A48 op 0x4 bit6 1, vnmls.f32 0xEE570A08
-            // op 0x5 bit6 0, vnmla.f32 0xEE570A48 op 0x5
-            // bit6 1; same (vn, bit6) semantics as f64. A
-            // guest vmla.f32 in Skia's font path panicked
-            // before this existed: core bug #12.)
-            if !dbl && matches!(op, 0x4 | 0x5) && ((word >> 8) & 0xF) == 0xA && (word >> 4) & 1 == 0 {
+            // vmla.f32 s1 = 0xEE470A08, vmls.f32 s1 =
+            // 0xEE470A48, vnmls.f32 s1 = 0xEE570A08,
+            // vnmla.f32 s1 = 0xEE570A48. Canonical ops are
+            // 0x0 (VMLA/VMLS) and 0x1 (VNMLA/VNMLS), with
+            // bit 6 the add/sub selector -- but an ODD
+            // destination register bleeds its low bit into
+            // op bit 22 (the bug #9 bleed), so odd-d forms
+            // read op 0x4/0x5. Mask bit 2 out (op3) before
+            // matching, exactly like the three-register
+            // block below; keying on raw op 0x4/0x5 missed
+            // every even-destination FMA (guest Skia:
+            // vmla.f32 s6, s7, s16 = 0xEE033A88).)
+            let opf = op & !0x4;
+            if !dbl && matches!(opf, 0x0 | 0x1) && ((word >> 8) & 0xF) == 0xA && (word >> 4) & 1 == 0 {
                 let (d, n, m) = (s_idx(word), n_idx_s(word), m_idx_s(word));
                 let prod = self.get_s(n) * self.get_s(m);
                 let acc = self.get_s(d);
-                let r = match (op, (word >> 6) & 1) {
-                    (0x4, 0) => acc + prod,
-                    (0x4, _) => acc - prod,
-                    (0x5, 0) => -acc + prod,
+                let r = match (opf, (word >> 6) & 1) {
+                    (0x0, 0) => acc + prod,
+                    (0x0, _) => acc - prod,
+                    (0x1, 0) => -acc + prod,
                     _ => -(acc + prod),
                 };
                 self.set_s(d, r);

@@ -41,6 +41,35 @@ _start:
     ldr r0, =0xc0f00000
     cmp r1, r0
     bne fail
+    @ Even destination registers: Vd's low bit is 0, so
+    @ op reads 0x0/0x1 instead of 0x4/0x5 (the guest's
+    @ actual failing case: vmla.f32 s6, s7, s16).
+    vmov s7, s1              @ n = 2.0
+    vmov s16, s2             @ m = 3.0
+    vmov s6, s0
+    vmla.f32 s6, s7, s16
+    vmov r1, s6
+    ldr r0, =0x40f00000
+    cmp r1, r0
+    bne fail
+    vmov s8, s0
+    vmls.f32 s8, s7, s16
+    vmov r1, s8
+    ldr r0, =0xc0900000
+    cmp r1, r0
+    bne fail
+    vmov s10, s0
+    vnmls.f32 s10, s7, s16
+    vmov r1, s10
+    ldr r0, =0x40900000
+    cmp r1, r0
+    bne fail
+    vmov s12, s0
+    vnmla.f32 s12, s7, s16
+    vmov r1, s12
+    ldr r0, =0xc0f00000
+    cmp r1, r0
+    bne fail
     @ f64 VNMLA (was unimplemented in the f64 block)
     ldr r0, =0x00000000
     ldr r1, =0x3ff80000      @ 1.5
