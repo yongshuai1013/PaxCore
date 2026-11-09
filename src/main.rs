@@ -374,8 +374,25 @@ impl Scheduler {
                 eprintln!("[paxcore] pcsample @{}", self.total_steps);
                 for p in &self.procs {
                     eprintln!(
-                        "[paxcore]   pid {} steps {} pc 0x{:08x} lr 0x{:08x}",
-                        p.pid, p.cpu.steps, p.cpu.r[15], p.cpu.r[14]
+                        "[paxcore]   pid {} steps {} pc 0x{:08x} lr 0x{:08x} r0 0x{:08x} r1 0x{:08x} r2 0x{:08x} r3 0x{:08x} r4 0x{:08x} r5 0x{:08x} r6 0x{:08x} r7 0x{:08x} r8 0x{:08x} r9 0x{:08x} r10 0x{:08x} r11 0x{:08x} r12 0x{:08x} sp 0x{:08x}",
+                        p.pid,
+                        p.cpu.steps,
+                        p.cpu.r[15],
+                        p.cpu.r[14],
+                        p.cpu.r[0],
+                        p.cpu.r[1],
+                        p.cpu.r[2],
+                        p.cpu.r[3],
+                        p.cpu.r[4],
+                        p.cpu.r[5],
+                        p.cpu.r[6],
+                        p.cpu.r[7],
+                        p.cpu.r[8],
+                        p.cpu.r[9],
+                        p.cpu.r[10],
+                        p.cpu.r[11],
+                        p.cpu.r[12],
+                        p.cpu.r[13]
                     );
                 }
             }
