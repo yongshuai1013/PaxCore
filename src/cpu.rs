@@ -1286,9 +1286,33 @@ impl Cpu {
                     (0x0, 0) => acc + prod,
                     (0x0, _) => acc - prod,
                     (0x1, 0) => -acc + prod,
-                    _ => return false, // VNMLA shape: no guest sample yet
+                    // VNMLA (assembler-verified encoding
+                    // 0xEE1E1B45): -(acc + prod).
+                    _ => -(acc + prod),
                 };
                 self.set_d(d, r);
+                self.r[REG_PC] = next_pc;
+                return true;
+            }
+            // Multiply-accumulate f32 family (the f64 block
+            // above's mirror; encodings assembler-verified:
+            // vmla.f32 0xEE470A08 op 0x4 bit6 0, vmls.f32
+            // 0xEE470A48 op 0x4 bit6 1, vnmls.f32 0xEE570A08
+            // op 0x5 bit6 0, vnmla.f32 0xEE570A48 op 0x5
+            // bit6 1; same (vn, bit6) semantics as f64. A
+            // guest vmla.f32 in Skia's font path panicked
+            // before this existed: core bug #12.)
+            if !dbl && matches!(op, 0x4 | 0x5) && ((word >> 8) & 0xF) == 0xA && (word >> 4) & 1 == 0 {
+                let (d, n, m) = (s_idx(word), n_idx_s(word), m_idx_s(word));
+                let prod = self.get_s(n) * self.get_s(m);
+                let acc = self.get_s(d);
+                let r = match (op, (word >> 6) & 1) {
+                    (0x4, 0) => acc + prod,
+                    (0x4, _) => acc - prod,
+                    (0x5, 0) => -acc + prod,
+                    _ => -(acc + prod),
+                };
+                self.set_s(d, r);
                 self.r[REG_PC] = next_pc;
                 return true;
             }

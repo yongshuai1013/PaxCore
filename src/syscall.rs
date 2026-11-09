@@ -1020,9 +1020,33 @@ impl Syscalls {
             // nice 0; bionic's wrapper maps it back. Zygote's
             // preload path queries it and carries on either way.
             96 => 20,
-            // madvise (220): pure performance advice; accepting
-            // it changes no semantics.
-            220 => 0,
+            // madvise (220): mostly performance advice, but
+            // MADV_DONTNEED (4) is a SEMANTIC operation: the
+            // kernel discards the pages and later reads return
+            // zeros. GB's GC resets its mark bitmap exactly
+            // this way; stubbing it to a no-op success left
+            // every stale mark bit in place, and the scanner
+            // then walked freed-and-reused heap objects as if
+            // still marked (zygote preload GC never finished:
+            // core bug #11). Honor it: drop shared windows in
+            // the range (their backing must not shadow the
+            // discard) and zero the private bytes, page-rounded
+            // like the kernel.
+            220 => {
+                if std::env::var_os("PAXCORE_MEMTRACE").is_some() {
+                    eprintln!(
+                        "[memtrace] pid {} madvise addr 0x{a0:08x} len 0x{a1:x} advice {a2}",
+                        self.pid
+                    );
+                }
+                if a2 == 4 && a1 != 0 {
+                    let base = a0 & !0xFFF;
+                    let end = (a0 + a1 + 0xFFF) & !0xFFF;
+                    mem.remove_shared(base, end - base);
+                    mem.zero_range(base, (end - base) as usize);
+                }
+                0
+            }
             64 => self.ppid,    // getppid
             224 => self.pid,    // gettid (no threads yet: tid == pid)
             _ => self.handle2(cpu, mem, nr),
@@ -1930,6 +1954,12 @@ impl Syscalls {
                 let base = a0 & !0xFFF;
                 if len == 0 {
                     return err(22); // EINVAL
+                }
+                if std::env::var_os("PAXCORE_MEMTRACE").is_some() {
+                    eprintln!(
+                        "[memtrace] pid {} munmap addr 0x{base:08x} len 0x{len:x}",
+                        self.pid
+                    );
                 }
                 self.unmap_range(base, len);
                 // Drop shared windows FIRST: unmapping must

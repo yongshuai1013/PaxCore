@@ -403,6 +403,17 @@ impl Scheduler {
                         "[paxcore]   pid {} tgid {} steps {} zombie {:?} pc 0x{:08x}",
                         p.pid, p.tgid, p.cpu.steps, p.zombie, p.cpu.r[15]
                     );
+                    {
+                        let asp = p.sys.asp.borrow();
+                        let mut line = format!(
+                            "[paxcore]   maps pid {} brk 0x{:08x}:",
+                            p.pid, asp.brk
+                        );
+                        for (b, l) in &asp.maps {
+                            line += &format!(" [0x{:08x}+0x{:x}]", b, l);
+                        }
+                        eprintln!("{line}");
+                    }
                     if let Ok(spec) = std::env::var("PAXCORE_DUMP") {
                         let mut it = spec.split(':');
                         if let (Some(range), Some(path)) = (it.next(), it.next()) {
