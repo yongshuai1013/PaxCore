@@ -358,7 +358,27 @@ impl Scheduler {
         watch_val: &mut u32,
     ) -> u32 {
         let mut cursor = 0usize;
+        // PAXCORE_PCSAMPLE=<steps>: periodically dump every
+        // process's pc/lr so a long guest phase (e.g. zygote
+        // class preloading) can be told apart from a spin --
+        // progressing work walks many functions, a loop sits
+        // in a handful.
+        let sample_every: u64 = std::env::var("PAXCORE_PCSAMPLE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut next_sample = sample_every;
         loop {
+            if sample_every > 0 && self.total_steps >= next_sample {
+                next_sample += sample_every;
+                eprintln!("[paxcore] pcsample @{}", self.total_steps);
+                for p in &self.procs {
+                    eprintln!(
+                        "[paxcore]   pid {} steps {} pc 0x{:08x} lr 0x{:08x}",
+                        p.pid, p.cpu.steps, p.cpu.r[15], p.cpu.r[14]
+                    );
+                }
+            }
             if self.total_steps >= max_steps() {
                 eprintln!("[paxcore] step limit reached");
                 for p in &self.procs {
