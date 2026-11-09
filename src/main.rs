@@ -234,6 +234,28 @@ fn main() {
         .ok()
         .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
     let mut watch_val: u32 = 0;
+    // PAXCORE_POKE=<target>:<value>:<trigger_addr>:<trigger_value>
+    // (all hex): once the trigger word holds the trigger value
+    // and the target word is still 0, write the value into the
+    // target (once). Diagnostic only: tests whether a single
+    // missing guest-memory write is sufficient to explain a
+    // hang, before hunting why the guest never wrote it.
+    let poke: Option<(u32, u32, u32, u32)> = std::env::var("PAXCORE_POKE")
+        .ok()
+        .and_then(|s| {
+            let p: Vec<u32> = s
+                .split(':')
+                .filter_map(|x| {
+                    u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()
+                })
+                .collect();
+            if p.len() == 4 {
+                Some((p[0], p[1], p[2], p[3]))
+            } else {
+                None
+            }
+        });
+    let mut poke_done = false;
     let mut sys = syscall::Syscalls::new(rootfs.clone(), loaded.image_end);
     sys.exe_path = match guest_path.strip_prefix(&rootfs) {
         Some(rest) => format!("/{}", rest.trim_start_matches('/')),
@@ -270,7 +292,7 @@ fn main() {
         total_steps: 0,
     };
     let t0 = Instant::now();
-    let code = sched.run(cache_on, watch, &mut watch_val);
+    let code = sched.run(cache_on, watch, &mut watch_val, poke, &mut poke_done);
     let dt = t0.elapsed();
     eprintln!(
         "[paxcore] guest exit({code}) after {} instructions in {:.3}s ({:.1} MIPS on this host)",
@@ -356,6 +378,8 @@ impl Scheduler {
         cache_on: bool,
         watch: Option<u32>,
         watch_val: &mut u32,
+        poke: Option<(u32, u32, u32, u32)>,
+        poke_done: &mut bool,
     ) -> u32 {
         let mut cursor = 0usize;
         // PAXCORE_PCSAMPLE=<steps>: periodically dump every
@@ -487,7 +511,7 @@ impl Scheduler {
                 }
             };
             cursor = idx + 1;
-            let slice_end = self.run_slice(idx, cache_on, watch, watch_val);
+            let slice_end = self.run_slice(idx, cache_on, watch, watch_val, poke, poke_done);
             // A syscall inside the slice may have written shared
             // memory (or mapped new code): drop decoded blocks of
             // the whole address-space group before anyone runs on.
@@ -578,6 +602,8 @@ impl Scheduler {
         cache_on: bool,
         watch: Option<u32>,
         watch_val: &mut u32,
+        poke: Option<(u32, u32, u32, u32)>,
+        poke_done: &mut bool,
     ) -> SliceEnd {
         let start_steps = self.procs[idx].cpu.steps;
         // Re-issue a pipe syscall that blocked last slice: the
@@ -672,6 +698,22 @@ impl Scheduler {
                                 p.cpu.steps
                             );
                             *watch_val = v;
+                        }
+                    }
+                    if let Some((taddr, tval, gaddr, gval)) = poke {
+                        if !*poke_done {
+                            let p = &self.procs[idx];
+                            let mut guard = p.mem.borrow_mut();
+                            if guard.read_u32(gaddr) == gval
+                                && guard.read_u32(taddr) == 0
+                            {
+                                guard.write_u32(taddr, tval);
+                                *poke_done = true;
+                                eprintln!(
+                                    "[poke] 0x{taddr:08x} := 0x{tval:08x} (trigger hit, pid {} step {})",
+                                    p.pid, p.cpu.steps
+                                );
+                            }
                         }
                     }
                 }

@@ -237,6 +237,16 @@ impl Cpu {
         }
         let word = self.rd(mem, pc);
         self.steps += 1;
+        if self.watch_pc == Some(pc) || self.watch_pc2 == Some(pc) {
+            eprintln!(
+                "[watchpc] steps={} pc=0x{pc:08x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x} r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x} sp={:#010x} lr={:#010x} nzcv={}{}{}{}",
+                self.steps,
+                self.r[0], self.r[1], self.r[2], self.r[3], self.r[4], self.r[5],
+                self.r[6], self.r[7], self.r[8], self.r[9], self.r[10], self.r[11], self.r[12],
+                self.r[13], self.r[14],
+                self.n as u8, self.z as u8, self.c as u8, self.v as u8
+            );
+        }
         if self.trace && self.steps >= self.trace_after {
             eprintln!("[trace] A pc=0x{pc:08x} w=0x{word:08x} r0=0x{:08x} r1=0x{:08x} r3=0x{:08x} r4=0x{:08x} sp=0x{:08x} lr=0x{:08x}", self.r[0], self.r[1], self.r[3], self.r[4], self.r[13], self.r[14]);
         }
@@ -478,6 +488,77 @@ impl Cpu {
                     a / b
                 };
                 self.r[rd] = r;
+                self.r[REG_PC] = next_pc;
+                return Step::Continue;
+            }
+        }
+        // Signed DSP multiplies (ARMv5TE): bits 27-24 == 0001,
+        // bits 7-4 == 1 <rs-half> <rm-half> 0. Field layout is
+        // media-style: Rd = bits 19-16, Rn/RdLo = bits 15-12,
+        // Rs = bits 11-8, Rm = bits 3-0; bit 6 picks Rs's half
+        // (1 = top), bit 5 picks Rm's half. bits 23-20 select:
+        // 0000 SMLAxy, 0110 SMULxy, 0100 SMLALxy, and 0010 the
+        // word forms -- SMULWy when bit 5 is set, SMLAWy when
+        // clear (all encodings assembler-verified). These fail
+        // the classic multiply gate below (bit 4 clear) and used
+        // to fall through every handler into the step tail, which
+        // silently skipped them -- core bug #14: FreeType's
+        // af_glyph_hints_reload computes the contour end pointer
+        // with `smulbb` (contours[0] * sizeof(AF_Point)); the
+        // skipped multiply left a stale register in the sum, the
+        // `point == end` test never fired, the last outline
+        // point's ->next was never written, and the hinting walk
+        // over the point list ran off its end and spun forever.
+        {
+            let top8 = (word >> 20) & 0xFF;
+            let is_dsp = (word >> 7) & 1 == 1
+                && (word >> 4) & 1 == 0
+                && matches!(top8, 0x10 | 0x12 | 0x14 | 0x16);
+            if is_dsp {
+                let rd = ((word >> 16) & 0xF) as usize;
+                let rn = ((word >> 12) & 0xF) as usize;
+                let rs = ((word >> 8) & 0xF) as usize;
+                let rm = (word & 0xF) as usize;
+                let rm_top = (word >> 5) & 1 == 1;
+                let rs_top = (word >> 6) & 1 == 1;
+                let get = |i: usize| -> u32 {
+                    if i == REG_PC { pc.wrapping_add(8) } else { self.r[i] }
+                };
+                let half = |v: u32, top: bool| -> i64 {
+                    (if top { (v >> 16) as u16 } else { v as u16 } as i16) as i64
+                };
+                match top8 {
+                    0x10 => {
+                        // SMLAxy
+                        let p = half(get(rm), rm_top) * half(get(rs), rs_top);
+                        self.r[rd] = get(rn).wrapping_add(p as u32);
+                    }
+                    0x16 => {
+                        // SMULxy
+                        let p = half(get(rm), rm_top) * half(get(rs), rs_top);
+                        self.r[rd] = p as u32;
+                    }
+                    0x14 => {
+                        // SMLALxy: RdHi:RdLo += hx(Rm) * hy(Rs)
+                        let p = half(get(rm), rm_top) * half(get(rs), rs_top);
+                        let acc = (((get(rd) as u64) << 32) | get(rn) as u64) as i64;
+                        let res = acc.wrapping_add(p) as u64;
+                        self.r[rn] = res as u32;
+                        self.r[rd] = (res >> 32) as u32;
+                    }
+                    _ => {
+                        // 0x12: word forms; Rs half from bit 6
+                        let p = (get(rm) as i32 as i64) * half(get(rs), rs_top);
+                        if rm_top {
+                            // SMULWy (bit 5 set marks the
+                            // no-accumulate form)
+                            self.r[rd] = (p >> 16) as u32;
+                        } else {
+                            // SMLAWy
+                            self.r[rd] = get(rn).wrapping_add((p >> 16) as u32);
+                        }
+                    }
+                }
                 self.r[REG_PC] = next_pc;
                 return Step::Continue;
             }
